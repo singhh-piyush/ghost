@@ -1,0 +1,67 @@
+#!/usr/bin/env bpftrace
+/*
+ * Ghost eBPF Connect Tracer
+ * Monitors all connect() syscalls in the ghost namespace
+ * Alerts if any connection attempts bypass Tor
+ * 
+ * Usage: bpftrace ghost_monitor.bt
+ * Requires: Linux 4.15+, bpftrace
+ */
+
+BEGIN
+{
+    printf("Ghost eBPF Monitor Started\n");
+    printf("Watching for non-Tor connections...\n\n");
+    @tor_addr = (uint32)0x0100007f;  /* 127.0.0.1 in network order */
+    @host_addr = (uint32)0x01c8c80a; /* 10.200.200.1 in network order */
+}
+
+tracepoint:syscalls:sys_enter_connect
+{
+    $sockfd = args->fd;
+    $addr = (struct sockaddr *)args->uservaddr;
+    
+    /* Only check AF_INET (IPv4) */
+    if ($addr->sa_family == AF_INET) {
+        $sin = (struct sockaddr_in *)$addr;
+        $ip = $sin->sin_addr.s_addr;
+        $port = (($sin->sin_port >> 8) & 0xff) | (($sin->sin_port & 0xff) << 8);
+        
+        /* Check if connection is to Tor (127.0.0.1 or 10.200.200.1) */
+        if ($ip != @tor_addr && $ip != @host_addr) {
+            /* Non-Tor connection detected! */
+            printf("[ALERT] %s (pid=%d) connecting to ", comm, pid);
+            printf("%d.%d.%d.%d:%d\n",
+                ($ip) & 0xff,
+                ($ip >> 8) & 0xff,
+                ($ip >> 16) & 0xff,
+                ($ip >> 24) & 0xff,
+                $port);
+            
+            @blocked[comm] = count();
+        }
+    }
+    
+    /* Check for IPv6 (should be blocked, but log if seen) */
+    if ($addr->sa_family == AF_INET6) {
+        printf("[WARN] IPv6 connect attempt by %s (pid=%d)\n", comm, pid);
+    }
+}
+
+/* Track Tor connections for stats */
+tracepoint:syscalls:sys_exit_connect
+/args->ret == 0/
+{
+    @successful[comm] = count();
+}
+
+END
+{
+    printf("\n=== Session Summary ===\n");
+    print(@blocked);
+    print(@successful);
+    clear(@blocked);
+    clear(@successful);
+    clear(@tor_addr);
+    clear(@host_addr);
+}

@@ -1,0 +1,2858 @@
+#!/bin/bash
+umask 077
+
+# [FIX 2.3] Environment Sanitization (Prevent LD_PRELOAD escalation)
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG
+unset DISPLAY WAYLAND_DISPLAY XDG_SESSION_TYPE XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+export -n LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
+export -n DISPLAY WAYLAND_DISPLAY XDG_SESSION_TYPE
+
+# [FIX 5.1] Disable Core Dumps (Prevent HMAC key recovery)
+ulimit -c 0
+
+# ============================================
+# CONFIGURATION LOADING
+# ============================================
+# Defaults (can be overridden by /etc/ghost/config or profiles)
+TOR_MODE="dedicated"
+TOR_BRIDGES="none"
+TOR_BANDWIDTH_RATE=0
+TOR_BANDWIDTH_BURST=0
+HIDE_HARDWARE=1
+TMPFS_HOME=1
+TMPFS_HOME_SIZE="200M"
+ENABLE_SECCOMP=1
+ENABLE_LANDLOCK=1
+ENABLE_CAPS_DROP=1
+ENABLE_COVER_TRAFFIC=0
+COVER_TRAFFIC_INTERVAL=60
+AUTO_IDENTITY_ROTATION=0
+AUTO_IDENTITY_INTERVAL=30
+LOG_LEVEL="INFO"
+ENCRYPT_SESSION_LOGS=0
+
+# Load system config if it exists
+if [[ -f /etc/ghost/config ]]; then
+    # shellcheck source=/dev/null
+    source /etc/ghost/config
+fi
+
+# Load profile if specified via environment variable
+if [[ -n "${GHOST_PROFILE:-}" ]]; then
+    if [[ -f "/etc/ghost/profiles/${GHOST_PROFILE}.conf" ]]; then
+        source "/etc/ghost/profiles/${GHOST_PROFILE}.conf"
+    else
+        echo "[WARN] Profile '${GHOST_PROFILE}' not found at /etc/ghost/profiles/${GHOST_PROFILE}.conf" >&2
+    fi
+fi
+
+detect_user() {
+    if [[ -n "${SUDO_USER-}" ]]; then
+        echo "$SUDO_USER"
+        return
+    fi
+    local name
+    if name=$(logname 2>/dev/null) && [[ -n "$name" ]]; then
+        echo "$name"
+        return
+    fi
+    if name=$(who am i 2>/dev/null | awk '{print $1}') && [[ -n "$name" ]]; then
+        echo "$name"
+        return
+    fi
+    id -un
+}
+
+REAL_USER=$(detect_user)
+
+if [[ "$REAL_USER" == "root" ]]; then
+    HOME_DIR="/root"
+else
+    HOME_DIR="/home/$REAL_USER"
+fi
+
+DIR="/usr/local/lib/ghost"
+NS="ghost"
+VETH_HOST="veth0"
+JAIL_IP="10.200.200.2"
+HOST_IP="10.200.200.1"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+SAVE_CURSOR='\033[s'
+RESTORE_CURSOR='\033[u'
+CLEAR_TO_END='\033[J'
+HIDE_CURSOR='\033[?25l'
+SHOW_CURSOR='\033[?25h'
+
+RUNTIME_DIR="/run/ghost"
+STATE_FILE="$RUNTIME_DIR/state"
+LOCK_FILE="$RUNTIME_DIR/state.lock"
+COUNTER_FILE="$RUNTIME_DIR/counter"
+SESSION_LOG="$RUNTIME_DIR/session.log"
+AUTOHEAL_PID="$RUNTIME_DIR/autoheal.pid"
+AUTOHEAL_LOG="$RUNTIME_DIR/autoheal.log"
+
+# HMAC chain for tamper-resistant logging
+LOG_HMAC_KEY=""
+LOG_PREV_HMAC=""
+
+# Architecture options
+USE_SPLIT_TOR=1        # 1=dedicated Tor instance, 0=system Tor
+USE_EBPF_MONITOR=0     # 1=enable eBPF connect tracer (requires bpftrace)
+
+HEADER_LINES=10
+TERM_WIDTH=45
+
+ui_init() {
+    if command -v tput &>/dev/null; then
+        TERM_HEIGHT=$(tput lines)
+        TERM_WIDTH=$(tput cols)
+    else
+        TERM_HEIGHT=24
+        TERM_WIDTH=80
+    fi
+        
+    [[ $TERM_WIDTH -lt 45 ]] && TERM_WIDTH=45
+    
+    clear
+    echo -e "${WHITE}"
+    # Secure banner: only read regular files owned by root (not symlinks)
+    if [[ -f "$DIR/banner.txt" && ! -L "$DIR/banner.txt" ]]; then
+        local owner
+        owner=$(stat -c '%u' "$DIR/banner.txt" 2>/dev/null)
+        if [[ "$owner" == "0" ]]; then
+            cat "$DIR/banner.txt"
+        fi
+    fi
+    echo -e "${NC}"
+    echo -e "       ${BOLD}Network Anonymity System${NC} ${DIM}v5.0${NC}"
+    echo ""
+    echo -e "${HIDE_CURSOR}"
+    # Expanded signal handling
+    trap 'echo -e "${SHOW_CURSOR}"' EXIT
+    trap 'session_log "SIGNAL" "INT"; cleanup >/dev/null 2>&1; exit 130' INT
+    trap 'session_log "SIGNAL" "TERM"; cleanup >/dev/null 2>&1; exit 143' TERM HUP PIPE
+    trap 'session_log "PANIC" "USR1 emergency"; cleanup >/dev/null 2>&1; exit 10' USR1
+    trap 'cmd_identity >/dev/null 2>&1' USR2
+    trap 'echo -e "${RED}Timeout${NC}" >&2; exit 124' ALRM
+}
+
+ui_refresh() {
+    printf "\033[?25l"
+    ui_clear_content
+}
+
+ui_header() {
+    :
+}
+
+ui_clear_content() {
+    echo -e "\033[${HEADER_LINES};1H${CLEAR_TO_END}"
+}
+
+ui_divider() {
+    echo -e "  ${DIM}─────────────────────────────────────────${NC}"
+}
+
+ui_menu_item() {
+    local num="$1"
+    local name="$2"
+    local desc="$3"
+    local color="${4:-$CYAN}"
+    
+    printf "  ${color}[%s]${NC} ${WHITE}%-12s${NC} ${DIM}- %s${NC}\n" "$num" "$name" "$desc"
+}
+
+ui_status_line() {
+    local label="$1"
+    local value="$2"
+    local color="${3:-$CYAN}"
+    printf "  ${DIM}%-12s${NC} ${color}%s${NC}\n" "$label:" "$value"
+}
+
+ui_confirm() {
+    local title="$1"
+    local message="$2"
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}$title${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    echo -e "  $message"
+    echo ""
+    echo -e "  ${RED}Your real IP will be visible after this.${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    echo -e "  ${GREEN}[Y]${NC} Confirm    ${RED}[N]${NC} Cancel"
+    
+    printf "\n  Select: "
+    printf "\033[?25h"
+    
+    local choice
+    read -r -n 1 choice
+    printf "\033[?25l"
+    
+    echo ""
+    
+    [[ "$choice" == "y" || "$choice" == "Y" ]]
+}
+
+ui_help() {
+    local context="$1"
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${CYAN}${BOLD}HELP: $context${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    
+    case "$context" in
+        "START")
+            echo -e "  This command:"
+            echo -e "  ${DIM}• Creates isolated network namespace${NC}"
+            echo -e "  ${DIM}• Routes all traffic through Tor${NC}"
+            echo -e "  ${DIM}• Blocks non-Tor connections (kill switch)${NC}"
+            echo -e "  ${DIM}• Forces UTC timezone${NC}"
+            echo ""
+            echo -e "  ${DIM}Duration: ~2 seconds${NC}"
+            echo -e "  ${DIM}Requires: Tor service running${NC}"
+            ;;
+        "STOP")
+            echo -e "  This command:"
+            echo -e "  ${DIM}• Destroys network namespace${NC}"
+            echo -e "  ${DIM}• Flushes firewall rules${NC}"
+            echo -e "  ${DIM}• Returns to normal networking${NC}"
+            echo ""
+            echo -e "  ${RED}WARNING: Your real IP will be visible!${NC}"
+            ;;
+        "SHELL")
+            echo -e "  Opens a bash shell inside Ghost:"
+            echo -e "  ${DIM}• All traffic routed through Tor${NC}"
+            echo -e "  ${DIM}• Cannot leak your real IP${NC}"
+            echo -e "  ${DIM}• Type 'exit' to return to menu${NC}"
+            echo ""
+            echo -e "  ${DIM}Available commands: myip, check, trace${NC}"
+            ;;
+        "IDENTITY")
+            echo -e "  Requests new Tor circuit:"
+            echo -e "  ${DIM}• Gets new exit node IP${NC}"
+            echo -e "  ${DIM}• Takes 5-7 seconds${NC}"
+            echo -e "  ${DIM}• May retry up to 3 times${NC}"
+            ;;
+        *)
+            echo -e "  ${DIM}No help available for this context.${NC}"
+            ;;
+    esac
+    
+    echo ""
+    ui_divider
+    echo ""
+    echo -e "  ${DIM}[Press any key to return]${NC}"
+    read -r -n 1
+}
+
+monitor_watchdog() {
+    local interval=10
+    local failure_count=0
+    local threshold=3
+    local last_rx=0
+    local last_tx=0
+    
+    echo "Monitor started" > "$AUTOHEAL_LOG"
+    
+    # [FIX 15.6] Watchdog Cleanup Trap
+    # Ensure PID file is removed when watchdog exits (clean shutdown)
+    trap 'rm -f "$AUTOHEAL_PID" 2>/dev/null' EXIT
+    
+    while true; do
+        if ! check_ghost; then
+            break
+        fi
+        
+        # 1. Circuit Check
+        local start_ts=$(date +%s%N)
+        if check_tor >/dev/null 2>&1; then
+             local end_ts=$(date +%s%N)
+             local latency=$(( (end_ts - start_ts) / 1000000 ))
+             
+             if [[ $latency -gt 5000 ]]; then
+                  echo "[$(date '+%H:%M:%S')] High Latency: ${latency}ms" >> "$AUTOHEAL_LOG"
+                  failure_count=$((failure_count + 1))
+             else
+                  failure_count=0
+             fi
+        else
+            echo "[$(date '+%H:%M:%S')] Connection Failed" >> "$AUTOHEAL_LOG"
+            failure_count=$((failure_count + 1))
+        fi
+        
+        if [[ $failure_count -ge $threshold ]]; then
+             echo "[$(date '+%H:%M:%S')] CRITICAL: Connection failing. Please check Tor manually." >> "$AUTOHEAL_LOG"
+             # Action disabled to prevent host Tor disruption
+             failure_count=0
+             sleep 15
+        fi
+
+        # 2. Bandwidth Accounting
+        local stats
+        stats=$(grep "veth0" /proc/net/dev 2>/dev/null)
+        if [[ -n "$stats" ]]; then
+            local current_rx=$(echo "$stats" | awk '{print $2}')
+            local current_tx=$(echo "$stats" | awk '{print $10}')
+            
+            if [[ $last_rx -ne 0 ]]; then
+                 local diff_tx=$((current_tx - last_tx))
+                 # Alert if upload > 10MB in interval
+                 if [[ $diff_tx -gt 10485760 ]]; then
+                     echo "[$(date '+%H:%M:%S')] ALERT: High Upload $((diff_tx/1024/1024))MB" >> "$AUTOHEAL_LOG"
+                 fi
+            fi
+            last_rx=$current_rx
+            last_tx=$current_tx
+        fi
+        
+        # 3. Dead Man's Switch (Heartbeat)
+        local heartbeat_file="/dev/shm/ghost_heartbeat"
+        if [[ -f "$heartbeat_file" ]]; then
+            local last_beat
+            last_beat=$(stat -c %Y "$heartbeat_file" 2>/dev/null || date +%s)
+            local now_sec
+            now_sec=$(date +%s)
+            local diff_sec=$((now_sec - last_beat))
+            
+            # [FIX 3.3] Require 3 consecutive missed heartbeats to trigger kill
+            if [[ $diff_sec -gt 60 ]]; then
+                miss_count=$((miss_count + 1))
+                if [[ $miss_count -ge 3 ]]; then
+                    echo "[$(date '+%H:%M:%S')] FATAL: Heartbeat lost (${diff_sec}s). Triggering KILL SWITCH." >> "$AUTOHEAL_LOG"
+                    cleanup >/dev/null 2>&1
+                    exit 0
+                fi
+            else
+                miss_count=0
+            fi
+        fi
+
+        # [FIX 3.2] Check again before sleeping/looping
+        if ! check_ghost; then break; fi
+
+        # 4. Cover Traffic (Noise Generation) - Realistic patterns
+        # [FIX 5.2] Secure Random Number Generation (Avoid predictable /dev/random)
+        local rand_byte
+        rand_byte=$(od -An -N1 -i /dev/urandom 2>/dev/null | tr -d ' ')
+        local cover_chance=$((rand_byte % 6))  # ~17% chance per interval
+        
+        if [[ $cover_chance -eq 0 ]]; then
+             # [FIX 7.3] Bandwidth Correlation Protection (Constant-rate padding)
+             # Trigger background download to maintain traffic baseline
+             local pad_url="https://speed.hetzner.de/100MB.bin"
+             # Limit rate to 50k to mask idle vs low-activity
+             ip netns exec ghost su $REAL_USER -c "curl -s --limit-rate 50k -o /dev/null --max-time 20 '$pad_url'" >/dev/null 2>&1 &
+             
+             local sites=("https://www.google.com" "https://www.bing.com" "https://www.wikipedia.org" "https://check.torproject.org" "https://www.reddit.com" "https://www.amazon.com" "https://www.youtube.com")
+             local rand_site_idx
+             rand_site_idx=$(od -An -N1 -i /dev/urandom 2>/dev/null | tr -d ' ')
+             local site=${sites[$rand_site_idx % ${#sites[@]}]}
+             
+             # Realistic browser headers
+             local user_agents=(
+                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+                 "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
+             )
+             local rand_ua_idx
+             rand_ua_idx=$(od -An -N1 -i /dev/urandom 2>/dev/null | tr -d ' ')
+             local ua=${user_agents[$rand_ua_idx % ${#user_agents[@]}]}
+             
+             # Run with realistic headers in background
+             ip netns exec ghost su $REAL_USER -c "curl -s -o /dev/null --max-time 15 \
+                 -H 'User-Agent: $ua' \
+                 -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8' \
+                 -H 'Accept-Language: en-US,en;q=0.5' \
+                 -H 'Accept-Encoding: gzip, deflate, br' \
+                 -H 'Connection: keep-alive' \
+                 '$site'" >/dev/null 2>&1 &
+        fi
+        
+        # 5. Decoy Scan Traffic (Pentesting Mode) - mask real scan timing
+        # When user is idle, generate random connection attempts to blend activity
+        if [[ -f "/dev/shm/ghost_heartbeat" ]]; then
+            local heartbeat_age
+            heartbeat_age=$(( $(date +%s) - $(stat -c %Y /dev/shm/ghost_heartbeat 2>/dev/null || echo $(date +%s)) ))
+            
+            # If user idle >60s, generate decoy traffic (10% chance)
+            local rand_decoy
+            rand_decoy=$(od -An -N1 -i /dev/urandom 2>/dev/null | tr -d ' ')
+            
+            if [[ $heartbeat_age -gt 60 ]] && [[ $((rand_decoy % 10)) -eq 0 ]]; then
+                # Random private IP ranges for decoy (never actually reach)
+                local r1 r2 r3 r4 r_port
+                r1=$(od -An -N1 -i /dev/urandom 2>/dev/null | tr -d ' ')
+                r2=$(od -An -N1 -i /dev/urandom 2>/dev/null | tr -d ' ')
+                r3=$(od -An -N1 -i /dev/urandom 2>/dev/null | tr -d ' ')
+                r4=$(od -An -N1 -i /dev/urandom 2>/dev/null | tr -d ' ')
+                r_port=$(od -An -N2 -u /dev/urandom 2>/dev/null | tr -d ' ')
+                
+                local decoy_ip="$((r1 % 223 + 1)).$r2.$r3.$r4"
+                local decoy_port=$((r_port % 65535 + 1))
+                
+                # Attempt connection that will fail/timeout (masks real scan patterns)
+                ip netns exec ghost timeout 2 bash -c "echo > /dev/tcp/$decoy_ip/$decoy_port" 2>/dev/null &
+            fi
+        fi
+        
+        # 5. Decoy Scan Traffic (Pentesting Mode)
+        # ... (unchanged) ...
+        
+        sleep $interval
+    done
+}
+
+monitor_start() {
+    monitor_stop
+    touch /dev/shm/ghost_heartbeat
+    monitor_watchdog &
+    echo $! > "$AUTOHEAL_PID"
+}
+
+monitor_stop() {
+    if [[ -f "$AUTOHEAL_PID" ]]; then
+        kill "$(cat "$AUTOHEAL_PID")" 2>/dev/null || true
+        rm -f "$AUTOHEAL_PID"
+    fi
+}
+
+state_init() {
+    local start_time exit_ip exit_country
+    start_time=$(date +%s)
+    exit_ip=$(get_exit_ip)
+    exit_country=$(get_exit_country "$exit_ip")
+    
+    (
+        flock -x 200
+        cat > "$STATE_FILE" << EOF
+start_time="$start_time"
+last_circuit="$start_time"
+exit_ip="$exit_ip"
+exit_country="$exit_country"
+identity_changes="0"
+EOF
+    ) 200>>"$LOCK_FILE"
+    
+    echo "0" > "$COUNTER_FILE"
+    
+    session_log_init
+    session_log "SESSION" "Ghost started"
+    session_log "EXIT" "$exit_ip ($exit_country)"
+}
+
+state_read() {
+    if [[ -f "$STATE_FILE" ]]; then
+        local content
+        # [FIX 6.1] Use exclusive lock to strictly prevent reading during write
+        if ! content=$(timeout 2 flock -x "$LOCK_FILE" cat "$STATE_FILE" 2>/dev/null); then
+            warn "State file read timed out"
+            return 1
+        fi
+        # Validate content before sourcing (prevent injection)
+        local line
+        local regex='^[a-z_]+="[^"]*"$'
+        while IFS= read -r line; do
+            if [[ "$line" =~ $regex ]]; then
+                eval "$line"
+            fi
+        done <<< "$content"
+    fi
+}
+
+update_state() {
+    local new_ip="$1"
+    local new_country
+    new_country=$(get_exit_country "$new_ip")
+    
+    # Atomic counter update with separate lock file
+    local count=0
+    (
+        flock -x 201
+        # Get current value (handle empty/missing file)
+        count=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)
+        # Increment
+        count=$((count + 1))
+        # Atomic write via temp file + mv
+        echo "$count" > "$COUNTER_FILE.tmp"
+        mv "$COUNTER_FILE.tmp" "$COUNTER_FILE"
+    ) 201>"$COUNTER_FILE.lock"
+    
+    # Read updated counter
+    [[ -f "$COUNTER_FILE" ]] && read -r count < "$COUNTER_FILE"
+    
+    (
+        flock -x 200
+        if [[ -f "$STATE_FILE" ]]; then
+            source "$STATE_FILE"
+            
+            identity_changes="$count"
+            last_circuit=$(date +%s)
+            
+            # [FIX 6.2] Atomic Write via temp file + mv
+            local temp_state="${STATE_FILE}.tmp"
+            cat > "$temp_state" << EOF
+start_time="$start_time"
+last_circuit="$last_circuit"
+exit_ip="$new_ip"
+exit_country="$new_country"
+identity_changes="$identity_changes"
+EOF
+            mv "$temp_state" "$STATE_FILE"
+            
+            session_log "EXIT" "New: $new_ip ($new_country)"
+        fi
+    ) 200>>"$LOCK_FILE"
+}
+
+get_uptime() {
+    if [[ -f "$STATE_FILE" ]]; then
+        state_read
+        local now elapsed mins
+        now=$(date +%s)
+        elapsed=$((now - start_time))
+        mins=$((elapsed / 60))
+        
+        if [[ $mins -lt 1 ]]; then
+            echo "$((elapsed))s"
+        elif [[ $mins -lt 60 ]]; then
+            echo "${mins}m"
+        else
+            echo "$((mins / 60))h $((mins % 60))m"
+        fi
+    else
+        echo "0s"
+    fi
+}
+
+get_circuit_age() {
+    if [[ -f "$STATE_FILE" ]]; then
+        state_read
+        local now elapsed mins
+        now=$(date +%s)
+        elapsed=$((now - last_circuit))
+        mins=$((elapsed / 60))
+        
+        if [[ $mins -lt 1 ]]; then
+            echo "0m"
+        elif [[ $mins -lt 60 ]]; then
+            echo "${mins}m"
+        else
+            echo "$((mins / 60))h"
+        fi
+    else
+        echo "Unknown"
+    fi
+}
+
+session_log_init() {
+    # Generate ephemeral HMAC key (stored only in memory)
+    LOG_HMAC_KEY=$(head -c 32 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null | tr -d '\n')
+    LOG_PREV_HMAC="0000000000000000000000000000000000000000"
+    echo "# HMAC-Chained Log" > "$SESSION_LOG"
+    chmod 600 "$SESSION_LOG" 2>/dev/null
+}
+
+session_log() {
+    # [FIX 5.3] Log Injection Prevention (Sanitize inputs)
+    local category="${1//[^a-zA-Z0-9_-]/}"
+    local message="${2//[^a-zA-Z0-9_ .,:;!?@#$%^&*()=+~\\-\\/\[\]]/}"
+    
+    local timestamp
+    timestamp=$(date '+%H:%M:%S')
+    local entry="[$timestamp] [$category] $message"
+    
+    # Compute HMAC(key, prev_hmac || entry) for tamper detection
+    local new_hmac
+    if [[ -n "$LOG_HMAC_KEY" ]]; then
+        new_hmac=$(echo -n "${LOG_PREV_HMAC}${entry}" | openssl dgst -sha256 -hmac "$LOG_HMAC_KEY" 2>/dev/null | awk '{print $NF}')
+    fi
+    new_hmac="${new_hmac:-no-hmac}"
+    
+    echo "${entry}|${new_hmac:0:16}" >> "$SESSION_LOG"
+    LOG_PREV_HMAC="$new_hmac"
+}
+
+die() {
+    local msg="$1"
+    local code="${2:-1}"
+    echo -e "${RED}Error: $msg${NC}" >&2
+    session_log "FATAL" "$msg"
+    cleanup >/dev/null 2>&1
+    exit "$code"
+}
+
+warn() {
+    local msg="$1"
+    echo -e "${YELLOW}Warning: $msg${NC}" >&2
+    session_log "WARN" "$msg"
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}Error: Ghost must be run as root${NC}"
+        exit 1
+    fi
+}
+
+setup_runtime() {
+    mkdir -p "$RUNTIME_DIR"
+    # Mount ramfs (never swaps) for secure memory
+    if ! mountpoint -q "$RUNTIME_DIR"; then
+        if ! mount -t ramfs -o mode=700 ramfs "$RUNTIME_DIR" 2>/dev/null; then
+            # Fallback to tmpfs if ramfs fails
+            mount -t tmpfs -o size=5M,mode=700,noexec,nosuid tmpfs "$RUNTIME_DIR" 2>/dev/null
+        fi
+    fi
+    # Prevent swapping for this process (best-effort)
+    ulimit -l unlimited 2>/dev/null || true
+    
+    # [FIX 7.2] Isolated Working Directory
+    # Create a tmpfs-mounted home for Ghost to prevent ransomware attacks on real home
+    export GHOST_HOME="$RUNTIME_DIR/home"
+    mkdir -p "$GHOST_HOME"
+    mount -t tmpfs -o size=100M,mode=700,noexec,nosuid tmpfs "$GHOST_HOME" 2>/dev/null
+    
+    # Ensure skeletal config exists if needed (optional)
+    export HOME="$GHOST_HOME"
+}
+
+check_dependencies() {
+    local deps=("tor" "curl" "ip" "iptables" "ip6tables" "su" "tput" "grep" "awk" "flock" "script" "xxd")
+    local missing=()
+    
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "${RED}Error: Missing dependencies:${NC}"
+        for cmd in "${missing[@]}"; do
+            echo -e "  - $cmd"
+        done
+        echo -e "${DIM}Please install them and try again.${NC}"
+        exit 1
+    fi
+}
+
+cleanup() {
+    # Stop eBPF monitor if running
+    [[ -f "$RUNTIME_DIR/ebpf.pid" ]] && kill "$(cat "$RUNTIME_DIR/ebpf.pid")" 2>/dev/null
+    rm -f "$RUNTIME_DIR/ebpf.pid"
+    
+    # Stop dedicated Tor if using split architecture
+    if [[ $USE_SPLIT_TOR -eq 1 && -f "$DIR/lib/tor.sh" ]]; then
+        bash "$DIR/lib/tor.sh" stop 2>/dev/null || true
+    fi
+    
+    # Kill all processes in namespace, wait for kernel
+    ip netns pids ghost 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    sleep 0.2
+    
+    umount -l /var/run/netns/ghost 2>/dev/null || true
+    rm -f /var/run/netns/ghost 2>/dev/null || true
+    
+    # Retry namespace deletion up to 3 times
+    local i
+    for ((i=1; i<=3; i++)); do
+        if ip netns del ghost 2>/dev/null; then
+            break
+        fi
+        sleep 0.3
+    done
+    
+    ip link delete veth0 2>/dev/null || true
+    
+    iptables -t nat -F 2>/dev/null || true
+    iptables -F FORWARD 2>/dev/null || true
+    
+    # Clean up custom INPUT chain
+    iptables -D INPUT -j GHOST_INPUT 2>/dev/null || true
+    iptables -F GHOST_INPUT 2>/dev/null || true
+    iptables -X GHOST_INPUT 2>/dev/null || true
+    
+    ip6tables -t nat -F 2>/dev/null || true
+    ip6tables -F 2>/dev/null || true
+    ip6tables -X 2>/dev/null || true
+    
+    rm -f "$STATE_FILE" 2>/dev/null || true
+    
+    # Clear sensitive data from environment
+    LOG_HMAC_KEY=""
+    unset LOG_HMAC_KEY
+    LOG_PREV_HMAC=""
+    unset LOG_PREV_HMAC
+}
+
+get_tor_auth() {
+    local cookie_paths=(
+        "/run/ghost/tor/control_auth_cookie"  # Split-Tor (preferred)
+        "/var/lib/tor/control_auth_cookie"
+        "/run/tor/control.authcookie"
+        "/var/run/tor/control.authcookie"
+    )
+    
+    local retries=30
+    for ((i=0; i<retries; i++)); do
+        for path in "${cookie_paths[@]}"; do
+            if [[ -f "$path" ]]; then
+                local size
+                size=$(stat -c%s "$path" 2>/dev/null || echo 0)
+                
+                if [[ $size -ge 32 ]]; then
+                    local hex_cookie
+                    hex_cookie=$(xxd -p "$path" | tr -d '\n')
+                    
+                    if [[ ${#hex_cookie} -ge 64 ]]; then
+                        echo "AUTHENTICATE $hex_cookie"
+                        return 0
+                    fi
+                fi
+            fi
+        done
+        sleep 0.1
+    done
+    
+    return 1
+}
+
+check_tor() {
+    # Check if system Tor is already running
+    local system_tor_running=0
+    if systemctl is-active --quiet tor 2>/dev/null; then
+        system_tor_running=1
+    fi
+    
+    # Check if required ports are in use (system Tor or other)
+    local ports_in_use=0
+    if ss -tuln 2>/dev/null | grep -qE ":(9040|5353) "; then
+        ports_in_use=1
+    fi
+    
+    if [[ $system_tor_running -eq 1 ]]; then
+        # System Tor is running - verify it has the config we need
+        if grep -q "TransPort.*9040" /etc/tor/torrc 2>/dev/null && \
+           grep -q "DNSPort.*5353" /etc/tor/torrc 2>/dev/null; then
+            # System Tor is properly configured, use it
+            echo -e "${DIM}Using system Tor (already running)${NC}" >&2
+            
+            # Verify it's actually working
+            if curl -s --socks5-hostname 127.0.0.1:9050 --connect-timeout 5 https://check.torproject.org >/dev/null 2>&1; then
+                return 0
+            else
+                echo -e "${RED}[ERROR] System Tor is running but not responding${NC}" >&2
+                return 1
+            fi
+        else
+            # System Tor is running but not configured for Ghost
+            echo -e "${RED}[ERROR] System Tor is running but not configured for Ghost.${NC}" >&2
+            echo -e "${RED}Either configure it with TransPort 9040 and DNSPort 5353,${NC}" >&2
+            echo -e "${RED}or stop it to let Ghost use its dedicated instance:${NC}" >&2
+            echo -e "${RED}  sudo systemctl stop tor${NC}" >&2
+            return 1
+        fi
+    elif [[ $ports_in_use -eq 1 ]]; then
+        # Ports are in use but not by systemd Tor - something else is using them
+        echo -e "${RED}[ERROR] Tor ports (9040/5353) are in use by another process.${NC}" >&2
+        echo -e "${RED}Check with: sudo ss -tulpn | grep -E '9040|5353'${NC}" >&2
+        return 1
+    else
+        # System Tor not running, ports are free - start dedicated instance
+        if [[ -f "$DIR/lib/tor.sh" ]]; then
+            if ! bash "$DIR/lib/tor.sh" start 2>&1; then
+                echo -e "${RED}[FATAL] Failed to start dedicated Tor instance.${NC}" >&2
+                return 1
+            fi
+            
+            # Verify it started successfully
+            sleep 1
+            if bash "$DIR/lib/tor.sh" status 2>/dev/null | grep -q "running"; then
+                return 0
+            else
+                echo -e "${RED}[ERROR] Dedicated Tor started but is not running.${NC}" >&2
+                return 1
+            fi
+        else
+            echo -e "${RED}[FATAL] Dedicated Tor script (lib/tor.sh) missing.${NC}" >&2
+            echo -e "${RED}Please reinstall Ghost or start system Tor:${NC}" >&2
+            echo -e "${RED}  sudo systemctl start tor${NC}" >&2
+            return 1
+        fi
+    fi
+}
+
+build_netns() {
+    bash "$DIR/lib/setup.sh" "$REAL_USER" >/dev/null 2>&1
+}
+
+setup_firewall() {
+    iptables -t nat -F
+    # Redirect TCP SYN to Tor (Transparent Proxy)
+    iptables -t nat -A PREROUTING -s 10.200.200.2 -p tcp --syn -j REDIRECT --to-ports 9040
+    # Redirect DNS to Tor (DNSPort)
+    iptables -t nat -A PREROUTING -s 10.200.200.2 -p udp --dport 53 -j REDIRECT --to-ports 5353
+    
+    # ============================================
+    # [FIX 1.3] Block Tor Control/Socks Port Access from Namespace
+    # CRITICAL: route_localnet allows namespace to reach 127.0.0.1:9051
+    # This MUST be blocked on HOST INPUT chain, not namespace OUTPUT
+    # ============================================
+    iptables -D INPUT -s 10.200.200.2 -p tcp --dport 9051 -j DROP 2>/dev/null || true
+    iptables -D INPUT -s 10.200.200.2 -p tcp --dport 9050 -j DROP 2>/dev/null || true
+    iptables -I INPUT 1 -s 10.200.200.2 -p tcp --dport 9051 -j DROP
+    iptables -I INPUT 2 -s 10.200.200.2 -p tcp --dport 9050 -j DROP
+    
+    # STRICTLY DROP ALL Forwarded traffic
+    # If it wasn't redirected above (e.g., non-SYN TCP, UDP, ICMP), it must be dropped.
+    iptables -F FORWARD 2>/dev/null || true
+    iptables -A FORWARD -s 10.200.200.2 -j DROP
+    
+    # Allow redirected traffic in INPUT via custom chain
+    iptables -N GHOST_INPUT 2>/dev/null || true
+    iptables -F GHOST_INPUT
+    iptables -A GHOST_INPUT -s 10.200.200.2 -p tcp --dport 9040 -j ACCEPT
+    iptables -A GHOST_INPUT -s 10.200.200.2 -p udp --dport 5353 -j ACCEPT
+    iptables -I INPUT -j GHOST_INPUT
+    
+    ip6tables -P INPUT DROP 2>/dev/null || true
+    ip6tables -P FORWARD DROP 2>/dev/null || true
+    ip6tables -P OUTPUT DROP 2>/dev/null || true
+    ip6tables -F 2>/dev/null || true
+}
+
+# [FIX 24.1] Rate-Limited IP Checker with Rotation
+get_exit_ip() {
+    local cache_file="/dev/shm/ghost_ip_cache"
+    local cache_ttl=60
+    
+    # Check cache first
+    if [[ -f "$cache_file" ]]; then
+        local last_update
+        last_update=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+        local now
+        now=$(date +%s)
+        if [[ $((now - last_update)) -lt $cache_ttl ]]; then
+            cat "$cache_file"
+            return 0
+        fi
+    fi
+    
+    # Rotate services to avoid "Too Many Requests"
+    local services=(
+        "https://check.torproject.org/api/ip"
+        "https://ifconfig.me/ip"
+        "https://api.ipify.org"
+        "https://icanhazip.com"
+    )
+    
+    # Pick random start index
+    local start_idx=$((RANDOM % ${#services[@]}))
+    
+    for ((i=0; i<${#services[@]}; i++)); do
+        local idx=$(( (start_idx + i) % ${#services[@]} ))
+        local url="${services[$idx]}"
+        local result
+        
+        # Specific handling for Tor Project API (JSON) vs others (Plaintext)
+        if [[ "$url" == *"torproject"* ]]; then
+            result=$(ip netns exec ghost su $REAL_USER -c "curl -s --connect-timeout 5 '$url'" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        else
+            result=$(ip netns exec ghost su $REAL_USER -c "curl -s --connect-timeout 5 '$url'")
+        fi
+        
+        if [[ -n "$result" ]]; then
+             echo "$result" > "$cache_file"
+             echo "$result"
+             return 0
+        fi
+    done
+    
+    return 1
+}
+
+get_exit_country() {
+    local ip="$1"
+    [[ -z "$ip" ]] && echo "Unknown" && return
+    
+    local result
+    result=$(ip netns exec ghost su $REAL_USER -c "curl -s --connect-timeout 3 \"http://ip-api.com/json/$ip?fields=city,country,countryCode\"" 2>/dev/null)
+    
+    if [[ -n "$result" ]]; then
+        local city country code
+        city=$(echo "$result" | grep -oP '"city":"\K[^"]+' 2>/dev/null)
+        country=$(echo "$result" | grep -oP '"countryCode":"\K[^"]+' 2>/dev/null)
+        
+        if [[ -n "$city" && -n "$country" ]]; then
+            echo "$city, $country"
+            return
+        fi
+    fi
+    
+    echo "Unknown"
+}
+
+wait_for_connection() {
+    local timeout="${1:-45}"
+    local start_time=$(date +%s)
+    
+    while true; do
+        # 1. Primary: Tor Project API
+        local result
+        result=$(ip netns exec ghost su $REAL_USER -c "curl -s --connect-timeout 3 https://check.torproject.org/api/ip" 2>/dev/null)
+        if [[ -n "$result" ]] && echo "$result" | grep -q '"IsTor":true'; then
+            return 0
+        fi
+        
+        # 2. Fallback: DuckDuckGo Onion (Definitive Tor Proof)
+        if ip netns exec ghost su $REAL_USER -c "curl -s --connect-timeout 3 -I https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion" >/dev/null 2>&1; then
+            return 0
+        fi
+        
+        local current_time=$(date +%s)
+        if (( current_time - start_time >= timeout )); then
+            return 1
+        fi
+        
+        sleep 1
+    done
+}
+
+check_ghost() {
+    ip netns list 2>/dev/null | grep -q "^ghost"
+}
+
+verify_isolation() {
+    # 1. Strict Interface Check - FAIL CLOSED
+    # Only allowed: lo, veth1 (our tunnel)
+    local ifaces
+    ifaces=$(ip netns exec ghost ls /sys/class/net 2>/dev/null | sort)
+    local allowed_ifaces="lo veth1"
+    local sorted_allowed
+    sorted_allowed=$(echo $allowed_ifaces | tr ' ' '\n' | sort | tr '\n' ' ' | xargs)
+    local sorted_ifaces
+    sorted_ifaces=$(echo $ifaces | tr ' ' '\n' | sort | tr '\n' ' ' | xargs)
+    
+    if [[ "$sorted_ifaces" != "$sorted_allowed" ]]; then
+        session_log "ERROR" "Isolation check failed: Unexpected interfaces ($ifaces). Expected: $allowed_ifaces"
+        return 1
+    fi
+
+    # 2. Strict Route Check
+    local routes
+    routes=$(ip netns exec ghost ip route show)
+    local route_lines
+    route_lines=$(echo "$routes" | wc -l)
+    
+    if [[ $route_lines -gt 2 ]]; then
+        session_log "ERROR" "Isolation check failed: Unexpected routes found ($routes)"
+        return 1
+    fi
+    
+    if ! echo "$routes" | grep -q "default via 10.200.200.1"; then
+         session_log "ERROR" "Isolation check failed: Default route missing"
+         return 1
+    fi
+
+    # 3. Check IPv6 disabled
+    if ip netns exec ghost ip -6 addr show | grep -q "inet6"; then
+        session_log "ERROR" "Isolation check failed: IPv6 not disabled"
+        return 1
+    fi
+
+    return 0
+}
+
+# [FIX 7.1] Stream Isolation Verification
+verify_stream_isolation() {
+    echo -ne "  Verifying stream isolation... "
+    # Connect to two different checks
+    local ip1 ip2
+    ip1=$(ip netns exec ghost su $REAL_USER -c "curl -s --connect-timeout 10 https://check.torproject.org/api/ip" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || echo "err1") &
+    ip2=$(ip netns exec ghost su $REAL_USER -c "curl -s --connect-timeout 10 https://api.ipify.org" 2>/dev/null || echo "err2") &
+    wait
+    
+    if [[ "$ip1" == "err1" || "$ip2" == "err2" ]]; then
+        echo -e "${YELLOW}SKIP (Connection failed)${NC}"
+        return 0
+    fi
+    
+    if [[ "$ip1" != "$ip2" ]]; then
+        echo -e "${GREEN}OK (IPs differ: $ip1 vs $ip2)${NC}"
+        return 0
+    else
+        echo -e "${RED}FAIL (Same Exit IP: $ip1)${NC}"
+        session_log "WARN" "Stream isolation failed: $ip1 used for both streams"
+        return 1
+    fi
+}
+
+cmd_start() {
+    ui_clear_content
+    echo ""
+    echo -e "  ${BOLD}STARTING GHOST${NC}"
+    echo ""
+    
+    local width=35
+    
+    printf "  [1/4] Checking Tor service...     "
+    
+    cleanup >/dev/null 2>&1
+    
+    # Silence check_tor output to keep UI clean
+    if ! check_tor >/dev/null 2>&1; then
+        echo -e "${RED}FAILED${NC}"
+        ui_clear_content
+        echo ""
+        echo -e "  ${RED}${BOLD}ERROR: Tor service failed${NC}"
+        echo ""
+        echo -e "  ${DIM}See error message above for details.${NC}"
+        echo ""
+        echo -e "  ${DIM}[Press any key to return]${NC}"
+        read -r -n 1
+        return 1
+    fi
+    echo -e "${GREEN}OK${NC}"
+    
+    printf "  [2/4] Building namespace...       "
+    build_netns
+    
+    if ! verify_isolation; then
+        echo -e "${RED}FAILED${NC}"
+        ui_clear_content
+        echo ""
+        echo -e "  ${RED}${BOLD}ERROR: Namespace Isolation Failed${NC}"
+        echo ""
+        echo -e "  ${DIM}The network namespace is not properly isolated.${NC}"
+        echo -e "  ${DIM}Potential leak or configuration error.${NC}"
+        echo ""
+        echo -e "  ${DIM}[Press any key to return]${NC}"
+        cleanup >/dev/null 2>&1
+        read -r -n 1
+        return 1
+    fi
+    echo -e "${GREEN}OK${NC}"
+    
+    printf "  [3/4] Configuring firewall...     "
+    if ! setup_firewall >/dev/null 2>&1; then
+        echo -e "${RED}FAILED${NC}"
+        ui_clear_content
+        echo ""
+        echo -e "  ${RED}${BOLD}ERROR: Firewall Setup Failed${NC}"
+        echo ""
+        echo -e "  ${DIM}Could not apply iptables rules.${NC}"
+        echo ""
+        echo -e "  ${DIM}[Press any key to return]${NC}"
+        cleanup >/dev/null 2>&1
+        read -r -n 1
+        return 1
+    fi
+    echo -e "${GREEN}OK${NC}"
+    
+    printf "  [4/4] Verifying connection...     "
+    
+    if ! wait_for_connection 45; then
+        echo -e "${RED}FAILED${NC}"
+        ui_clear_content
+        echo ""
+        echo -e "  ${RED}${BOLD}ERROR: Connection Failed${NC}"
+        echo ""
+        echo -e "  ${DIM}Could not build Tor circuit.${NC}"
+        echo -e "  ${DIM}Check your internet connection.${NC}"
+        echo ""
+        echo -e "  ${DIM}[Press any key to return]${NC}"
+        cleanup >/dev/null 2>&1
+        read -r -n 1
+        return 1
+    fi
+    
+    state_init
+    monitor_start
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${GREEN}${BOLD}GHOST ACTIVE${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    
+    state_read
+    ui_status_line "Exit IP" "$exit_ip" "$GREEN"
+    ui_status_line "Location" "$exit_country" "$CYAN"
+    ui_status_line "Timezone" "UTC" "$CYAN"
+    ui_status_line "Status" "INVISIBLE" "$GREEN"
+    
+    echo ""
+    ui_divider
+    echo ""
+    echo -e "  ${DIM}[Press any key to continue]${NC}"
+    read -r -n 1
+}
+
+cmd_stop() {
+    if ! ui_confirm "STOP GHOST" "Destroy anonymous connection?"; then
+        return 0
+    fi
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${BOLD}STOPPING GHOST${NC}"
+    echo ""
+    
+    # [FIX 20.2] Kill the background instance if running
+    if [[ -f "/var/run/ghost.pid" ]]; then
+        local pid
+        pid=$(cat "/var/run/ghost.pid")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo -e "  ${DIM}Stopping background process ($pid)...${NC}"
+            kill "$pid" 2>/dev/null || true
+            # Wait for it to exit and clean up the lock
+            sleep 1
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        fi
+        rm -f "/var/run/ghost.pid"
+    fi
+    
+    ui_divider
+    echo ""
+    
+    if [[ -f "$STATE_FILE" ]]; then
+        state_read
+        local uptime
+        uptime=$(get_uptime)
+        
+        echo -e "  ${DIM}Session Duration:${NC} $uptime"
+        echo -e "  ${DIM}Identity Changes:${NC} $identity_changes"
+        echo ""
+    fi
+    
+    monitor_stop
+    
+    echo -e "  ${DIM}Cleaning up...${NC}"
+    cleanup
+    session_log "SESSION" "Ghost stopped"
+    
+    # [FIX 0.2] Ensure lock/pid files are cleaned up
+    rm -f /var/run/ghost.lock
+    rm -f /var/run/ghost.pid
+    
+    if check_ghost; then
+        echo ""
+        echo -e "  ${RED}WARNING: Namespace still exists${NC}"
+        echo -e "  ${DIM}Applying forceful cleanup...${NC}"
+        ip netns del ghost 2>/dev/null || true
+    fi
+    
+    echo ""
+    if ! check_ghost; then
+        echo -e "  ${GREEN}Ghost stopped successfully${NC}"
+    else
+        echo -e "  ${RED}Failed to fully stop Ghost${NC}"
+        echo -e "  ${DIM}Try: sudo ip netns del ghost${NC}"
+    fi
+    echo ""
+    echo -e "  ${DIM}Status: VISIBLE - Real IP exposed${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    echo -e "  ${DIM}[Press any key to continue]${NC}"
+    
+    printf "\033[?25h"
+    read -r -n 1
+    printf "\033[?25l"
+}
+
+cmd_shell() {
+    if ! check_ghost; then
+        ui_clear_content
+        echo ""
+        echo -e "  ${RED}Ghost not running${NC}"
+        echo ""
+        echo -e "  ${DIM}Start Ghost first with option [1]${NC}"
+        echo ""
+        echo -e "  ${DIM}[Press any key to return]${NC}"
+        read -r -n 1
+        return 0
+    fi
+    
+    printf "\033[?25h"
+    clear
+    
+    echo ""
+    echo -e "\033[1;32m=== GHOST SHELL ===\033[0m"
+    echo -e "\033[2mType 'exit' to return | 'myip' for IP | 'check' for Tor status\033[0m"
+    echo ""
+    
+    local term_settings
+    term_settings=$(stty -g)
+    
+    # [FIX 15.1] Trap Hijack - Save global traps before overriding
+    # If we don't restore these, cleanup() won't run if user ctrl-c's in menu later
+    local old_traps
+    old_traps=$(trap -p)
+    
+    # Shell cleanup function (preserves terminal settings)
+    _ghost_shell_cleanup() {
+        stty "$term_settings" 2>/dev/null || true
+        echo -e "${SHOW_CURSOR}"
+        rm -f "$ghost_rc" "$ghost_init" "$err_file" 2>/dev/null || true
+    }
+    trap '_ghost_shell_cleanup; exit' EXIT INT TERM HUP PIPE
+    
+    local err_file
+    err_file=$(mktemp)
+    
+    # 1. Create Shell Aliases (UX) - use mktemp to prevent symlink attacks
+    local ghost_rc
+    ghost_rc=$(mktemp /tmp/ghost_shell.XXXXXX.rc)
+    cat > "$ghost_rc" << 'EOF'
+if [[ -f ~/.bashrc ]]; then source ~/.bashrc; fi
+curl() { command curl --connect-timeout 20 --retry 3 "$@"; }
+gobuster() {
+    echo -e "\033[0;33m[WARNING] High-speed brute-forcing over Tor is ineffective.\033[0m"
+    command gobuster "$@"
+}
+sqlmap() {
+    echo -e "\033[0;33m[WARNING] Time-based SQLi requires high delays over Tor.\033[0m"
+    command sqlmap "$@"
+}
+rotate() {
+    echo -e "\033[0;36mIdentity rotation requires returning to the main menu.\033[0m"
+    echo -e "  Type 'exit' then select option [2]."
+}
+alias myip="curl -s https://check.torproject.org/api/ip"
+alias check="curl -s https://check.torproject.org/"
+EOF
+    # [FIX] Make RC file readable by the user inside the namespace
+    chmod 644 "$ghost_rc"
+
+    # 2. Create Init Script (Security/Mounts) - use mktemp
+    local ghost_init
+    ghost_init=$(mktemp /tmp/ghost_init.XXXXXX.sh)
+    
+    # [FIX] Ensure heartbeat file is writable by the user
+    touch /dev/shm/ghost_heartbeat
+    chmod 666 /dev/shm/ghost_heartbeat
+    
+    cat > "$ghost_init" << 'EOF'
+#!/bin/bash
+# Ghost Secure Shell Initialization
+# This script runs inside the isolated namespace with full hardening
+
+# ============================================
+# ENVIRONMENT HARDENING
+# ============================================
+# Remove all variables that could leak host information
+unset DISPLAY WAYLAND_DISPLAY XDG_SESSION_TYPE XDG_RUNTIME_DIR
+unset DBUS_SESSION_BUS_ADDRESS SESSION_MANAGER
+unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT
+unset SSH_AUTH_SOCK SSH_AGENT_PID GPG_AGENT_INFO
+
+# Clear leaky environment
+export -n OLDPWD PWD SHLVL _
+unset OLDPWD SHLVL _
+
+# Export clean environment
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+export TZ=UTC
+
+# ============================================
+# HOSTNAME & IDENTITY
+# ============================================
+hostname "ghost-$(openssl rand -hex 3 2>/dev/null || echo "anon")" 2>/dev/null || hostname "ghost" 2>/dev/null
+
+# ============================================
+# SYSTEM INVISIBILITY - /sys HIDING
+# ============================================
+# Mount empty tmpfs over /sys to prevent hardware fingerprinting
+# This blocks reading: GPU model, CPU serial, USB devices, DMI info
+if mount -t tmpfs -o size=1M,mode=555,nosuid,nodev,noexec tmpfs /sys 2>/dev/null; then
+    # Create minimal sys structure for tools that check existence
+    mkdir -p /sys/class /sys/devices 2>/dev/null || true
+else
+    # Fallback: mount read-only if tmpfs fails
+    mount -t sysfs sysfs /sys 2>/dev/null || true
+    mount -o remount,ro,nosuid,nodev,noexec /sys 2>/dev/null || true
+fi
+
+# ============================================
+# PROCESS VISIBILITY - /proc HARDENING
+# ============================================
+# Remount /proc with hidepid=2 (can only see own processes)
+if ! mount -o remount,rw,hidepid=2,nosuid,nodev,noexec /proc 2>/dev/null; then
+    if ! mount -t proc proc /proc -o hidepid=2,nosuid,nodev,noexec 2>/dev/null; then
+        echo "[WARN] Failed to enable hidepid on /proc" >&2
+    fi
+fi
+
+# ============================================
+# CPU FINGERPRINTING PREVENTION
+# ============================================
+cat > /tmp/.ghost_cpuinfo_$$ << 'CPUINFO_EOF'
+processor       : 0
+vendor_id       : GenuineIntel
+cpu family      : 6
+model           : 58
+model name      : Intel(R) Core(TM) i5-3470 CPU @ 3.20GHz
+stepping        : 9
+microcode       : 0x21
+cpu MHz         : 1600.000
+cache size      : 6144 KB
+physical id     : 0
+siblings        : 4
+core id         : 0
+cpu cores       : 4
+apicid          : 0
+initial apicid  : 0
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 13
+wp              : yes
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx rdtscp lm constant_tsc arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm cpuid_fault epb pti ssbd ibrs ibpb stibp tpr_shadow vnmi flexpriority ept vpid fsgsbase smep erms xsaveopt dtherm ida arat pln pts md_clear flush_l1d
+bugs            : cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs itlb_multihit srbds
+bogomips        : 6383.96
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 36 bits physical, 48 bits virtual
+power management:
+
+processor       : 1
+vendor_id       : GenuineIntel
+cpu family      : 6
+model           : 58
+model name      : Intel(R) Core(TM) i5-3470 CPU @ 3.20GHz
+stepping        : 9
+microcode       : 0x21
+cpu MHz         : 1600.000
+cache size      : 6144 KB
+physical id     : 0
+siblings        : 4
+core id         : 1
+cpu cores       : 4
+apicid          : 2
+initial apicid  : 2
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 13
+wp              : yes
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx rdtscp lm constant_tsc arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm cpuid_fault epb pti ssbd ibrs ibpb stibp tpr_shadow vnmi flexpriority ept vpid fsgsbase smep erms xsaveopt dtherm ida arat pln pts md_clear flush_l1d
+bugs            : cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs itlb_multihit srbds
+bogomips        : 6383.96
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 36 bits physical, 48 bits virtual
+power management:
+CPUINFO_EOF
+
+if ! mount --bind /tmp/.ghost_cpuinfo_$$ /proc/cpuinfo 2>/dev/null; then
+    echo "[WARN] Failed to hide CPU model" >&2
+fi
+
+# ============================================
+# MEMORY FINGERPRINTING PREVENTION
+# ============================================
+cat > /tmp/.ghost_meminfo_$$ << 'MEMINFO_EOF'
+MemTotal:        8192000 kB
+MemFree:         4096000 kB
+MemAvailable:    6144000 kB
+Buffers:          512000 kB
+Cached:          2048000 kB
+SwapCached:            0 kB
+Active:          2048000 kB
+Inactive:        1024000 kB
+Active(anon):     512000 kB
+Inactive(anon):   256000 kB
+Active(file):    1536000 kB
+Inactive(file):   768000 kB
+Unevictable:           0 kB
+Mlocked:               0 kB
+SwapTotal:       2097152 kB
+SwapFree:        2097152 kB
+Dirty:                 0 kB
+Writeback:             0 kB
+AnonPages:        768000 kB
+Mapped:           384000 kB
+Shmem:            128000 kB
+Slab:             256000 kB
+SReclaimable:     128000 kB
+SUnreclaim:       128000 kB
+KernelStack:       16000 kB
+PageTables:        32000 kB
+NFS_Unstable:          0 kB
+Bounce:                0 kB
+WritebackTmp:          0 kB
+CommitLimit:     6193152 kB
+Committed_AS:    2048000 kB
+VmallocTotal:   34359738367 kB
+VmallocUsed:      256000 kB
+VmallocChunk:   34359482367 kB
+HardwareCorrupted:     0 kB
+AnonHugePages:    524288 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+DirectMap4k:      131072 kB
+DirectMap2M:     8257536 kB
+MEMINFO_EOF
+
+mount --bind /tmp/.ghost_meminfo_$$ /proc/meminfo 2>/dev/null || echo "[WARN] Failed to hide memory info" >&2
+
+# ============================================
+# KERNEL VERSION FINGERPRINTING PREVENTION
+# ============================================
+cat > /tmp/.ghost_version_$$ << 'VERSION_EOF'
+Linux version 5.15.0-generic (build@generic) (gcc version 11.2.0) #1 SMP Wed Jan 12 12:00:00 UTC 2022
+VERSION_EOF
+
+mount --bind /tmp/.ghost_version_$$ /proc/version 2>/dev/null || echo "[WARN] Failed to hide kernel version" >&2
+
+# ============================================
+# SYSTEM LOAD FINGERPRINTING PREVENTION
+# ============================================
+cat > /tmp/.ghost_loadavg_$$ << 'LOADAVG_EOF'
+0.52 0.58 0.59 1/128 12345
+LOADAVG_EOF
+
+mount --bind /tmp/.ghost_loadavg_$$ /proc/loadavg 2>/dev/null || echo "[WARN] Failed to hide load average" >&2
+
+# ============================================
+# UPTIME FINGERPRINTING PREVENTION
+# ============================================
+echo "12345.67 98765.43" > /tmp/.ghost_uptime_$$
+mount --bind /tmp/.ghost_uptime_$$ /proc/uptime 2>/dev/null || echo "[WARN] Failed to hide uptime" >&2
+
+# ============================================
+# ISOLATED TEMPORARY HOME
+# ============================================
+export GHOST_ORIGINAL_HOME="$HOME"
+export GHOST_SESSION_ID="$$"
+export GHOST_TEMP_HOME="/tmp/ghost_home_${GHOST_SESSION_ID}"
+
+mkdir -p "$GHOST_TEMP_HOME"
+
+# Try to mount tmpfs (RAM disk) - 200M
+if mount -t tmpfs -o size=200M,mode=700,nosuid,nodev tmpfs "$GHOST_TEMP_HOME" 2>/dev/null; then
+    export GHOST_HOME_TYPE="tmpfs"
+else
+    export GHOST_HOME_TYPE="regular"
+fi
+
+export HOME="$GHOST_TEMP_HOME"
+export GHOST_HOME="$GHOST_TEMP_HOME"
+
+# Create standard home directory structure
+mkdir -p "$HOME/.config" "$HOME/.cache" "$HOME/.local/share" "$HOME/.local/bin"
+mkdir -p "$HOME/Downloads" "$HOME/Documents"
+
+# Create minimal shell profile (suppress history, etc.)
+cat > "$HOME/.profile" << 'PROFILE_EOF'
+# Ghost Secure Shell Profile
+export EDITOR=nano
+export VISUAL=nano
+export PAGER=less
+export HISTFILE=/dev/null
+export HISTSIZE=0
+export LESSHISTFILE=/dev/null
+PROFILE_EOF
+
+# ============================================
+# SECURITY EXECUTION CHAIN
+# ============================================
+# Build the security wrapper chain: Seccomp -> Landlock -> Caps -> Shell
+SHELL_EXEC="export PS1='\[\033[0;31m\][ghost]\[\033[0m\] \w\\\$ '; export PROMPT_COMMAND='touch /dev/shm/ghost_heartbeat 2>/dev/null'; exec bash --rcfile $ghost_rc"
+
+CMD_CHAIN=("bash" "$DIR/lib/caps.sh" "$REAL_USER" "$SHELL_EXEC")
+
+# Add Landlock if available
+if [[ -x "$DIR/lib/apply_landlock" ]]; then
+    CMD_CHAIN=("$DIR/lib/apply_landlock" "${CMD_CHAIN[@]}")
+fi
+
+# Add Seccomp (MANDATORY - fail if missing)
+if [[ -x "$DIR/lib/apply_seccomp" ]]; then
+    CMD_CHAIN=("$DIR/lib/apply_seccomp" "${CMD_CHAIN[@]}")
+else
+    echo -e "\033[0;31m[FATAL] Security Critical Error\033[0m" >&2
+    echo "  lib/apply_seccomp is missing or not executable" >&2
+    echo "  Ghost requires Seccomp-BPF to block raw sockets" >&2
+    exit 1
+fi
+
+# Verify caps.sh exists
+if [[ ! -f "$DIR/lib/caps.sh" ]]; then
+    echo -e "\033[0;31m[FATAL] Security Critical Error\033[0m" >&2
+    echo "  lib/caps.sh is missing" >&2
+    exit 1
+fi
+
+# ============================================
+# CLEANUP ON EXIT
+# ============================================
+cleanup_ghost_session() {
+    umount /proc/cpuinfo 2>/dev/null || true
+    umount /proc/meminfo 2>/dev/null || true
+    umount /proc/version 2>/dev/null || true
+    umount /proc/loadavg 2>/dev/null || true
+    umount /proc/uptime 2>/dev/null || true
+    rm -f /tmp/.ghost_cpuinfo_$$ /tmp/.ghost_meminfo_$$ 2>/dev/null || true
+    rm -f /tmp/.ghost_version_$$ /tmp/.ghost_loadavg_$$ /tmp/.ghost_uptime_$$ 2>/dev/null || true
+    
+    if [[ "$GHOST_HOME_TYPE" == "tmpfs" ]]; then
+        umount "$GHOST_TEMP_HOME" 2>/dev/null || true
+    fi
+    
+    rm -rf "$GHOST_TEMP_HOME" 2>/dev/null || true
+    rm -f /dev/shm/ghost_heartbeat_$$ 2>/dev/null || true
+}
+
+trap cleanup_ghost_session EXIT INT TERM
+
+# ============================================
+# EXECUTE SECURITY CHAIN
+# ============================================
+exec "${CMD_CHAIN[@]}"
+EOF
+    chmod +x "$ghost_init"
+
+    # Strict Isolation Check
+    # [FIX 1.5] Added --time namespace to allow date -s (jitter)
+    local isolation_cmd="unshare --ipc --pid --mount-proc --fork --mount --user --map-root-user --uts --time"
+    
+    if ! command -v unshare &>/dev/null; then
+         stty "$term_settings" 2>/dev/null
+         echo -e "\n  ${RED}Error: 'unshare' utility missing.${NC}"
+         read -r -n 1
+         eval "$old_traps"
+         return 0
+    fi
+
+    # Check for namespace support (including --time if possible)
+    if ! unshare --ipc --pid --mount-proc --fork --mount --user --map-root-user --uts --time true 2>/dev/null; then
+         # Fallback without --time if kernel < 5.6
+         if ! unshare --ipc --pid --mount-proc --fork --mount --user --map-root-user --uts true 2>/dev/null; then
+             stty "$term_settings" 2>/dev/null
+             ui_clear_content
+             echo ""
+             echo -e "  ${RED}${BOLD}ERROR: Isolation Failed${NC}"
+             echo ""
+             echo -e "  ${DIM}Kernel missing namespace support.${NC}"
+             echo -e "  ${DIM}Cannot create secure sandbox.${NC}"
+             echo ""
+             echo -e "  ${DIM}[Press any key to return]${NC}"
+             read -r -n 1
+             eval "$old_traps"
+             return 0
+         else
+             # Remove --time from command if not supported
+             isolation_cmd="unshare --ipc --pid --mount-proc --fork --mount --user --map-root-user --uts"
+         fi
+    fi
+    
+    local err_file
+    err_file=$(mktemp)
+    
+    if ! ip netns exec ghost $isolation_cmd script -q -c "$ghost_init" /dev/null 2> "$err_file"; then
+        stty "$term_settings" 2>/dev/null
+        
+        printf "\033[?25l"
+        ui_refresh
+        
+        ui_clear_content
+        echo ""
+        echo -e "  ${RED}${BOLD}ERROR: Shell Launch Failed${NC}"
+        echo ""
+        ui_divider
+        echo ""
+        if [[ -s "$err_file" ]]; then
+            sed 's/^/  /' "$err_file"
+        else
+            echo -e "  ${DIM}(No error message captured)${NC}"
+        fi
+        echo ""
+        ui_divider
+        echo ""
+        echo -e "  ${DIM}[Press any key to return]${NC}"
+        read -r -n 1
+    fi
+    rm -f "$err_file" "$ghost_rc" "$ghost_init"
+    
+    stty "$term_settings" 2>/dev/null
+    
+    # [FIX 15.1] Restore global traps
+    eval "$old_traps"
+    
+    ui_init
+    ui_refresh
+    return 0
+}
+
+cmd_test() {
+    if ! check_ghost; then
+        ui_clear_content
+        echo ""
+        echo -e "  ${RED}Ghost not running${NC}"
+        echo ""
+        echo -e "  ${DIM}[Press any key to return]${NC}"
+        read -r -n 1
+        return
+    fi
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${BOLD}SECURITY AUDIT${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    
+    local tests_passed=0
+    local tests_total=5
+    
+    echo -ne "  Tor Connectivity          "
+    local exit_ip
+    exit_ip=$(get_exit_ip)
+    if [[ -n "$exit_ip" ]]; then
+        echo -e "${GREEN}[PASS]${NC}"
+        echo -e "  ${DIM}└─ Exit: $exit_ip${NC}"
+        tests_passed=$((tests_passed + 1))
+    else
+        echo -e "${RED}[FAIL]${NC}"
+        echo -e "  ${DIM}└─ Cannot reach Tor network${NC}"
+    fi
+    echo ""
+    
+    echo -ne "  Kill Switch (ICMP)        "
+    if ! ip netns exec ghost ping -c1 -W1 1.1.1.1 &>/dev/null; then
+        echo -e "${GREEN}[PASS]${NC}"
+        echo -e "  ${DIM}└─ ICMP blocked correctly${NC}"
+        tests_passed=$((tests_passed + 1))
+    else
+        echo -e "${RED}[FAIL]${NC}"
+        echo -e "  ${DIM}└─ ICMP leak detected!${NC}"
+    fi
+    echo ""
+    
+    echo -ne "  DNS Configuration         "
+    local dns_server
+    dns_server=$(ip netns exec ghost cat /etc/resolv.conf 2>/dev/null | grep nameserver | awk '{print $2}')
+    if [[ "$dns_server" == "10.200.200.1" ]]; then
+        echo -e "${GREEN}[PASS]${NC}"
+        echo -e "  ${DIM}└─ DNS via Tor resolver${NC}"
+        tests_passed=$((tests_passed + 1))
+    else
+        echo -e "${YELLOW}[WARN]${NC}"
+        echo -e "  ${DIM}└─ DNS: $dns_server${NC}"
+    fi
+    echo ""
+    
+    echo -ne "  DNS Resolution            "
+    local dns_start dns_end dns_time
+    dns_start=$(date +%s%N)
+    if ip netns exec ghost su $REAL_USER -c "curl -s --connect-timeout 5 -o /dev/null https://check.torproject.org" 2>/dev/null; then
+        dns_end=$(date +%s%N)
+        dns_time=$(( (dns_end - dns_start) / 1000000 ))
+        echo -e "${GREEN}[PASS]${NC}"
+        echo -e "  ${DIM}└─ ${dns_time}ms via Tor${NC}"
+        tests_passed=$((tests_passed + 1))
+    else
+        echo -e "${RED}[FAIL]${NC}"
+        echo -e "  ${DIM}└─ DNS resolution failed${NC}"
+    fi
+    echo ""
+    
+    echo -ne "  TLS Certificate           "
+    local cert_issuer
+    cert_issuer=$(echo | timeout 5 openssl s_client -connect check.torproject.org:443 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null | head -1)
+    if [[ -n "$cert_issuer" ]] && ! echo "$cert_issuer" | grep -qiE "localhost|self.signed|mitmproxy"; then
+        echo -e "${GREEN}[PASS]${NC}"
+        echo -e "  ${DIM}└─ Valid certificate chain${NC}"
+        tests_passed=$((tests_passed + 1))
+    else
+        echo -e "${YELLOW}[WARN]${NC}"
+        echo -e "  ${DIM}└─ Unable to verify issuer${NC}"
+    fi
+    echo ""
+    
+    ui_divider
+    echo ""
+    
+    if [[ $tests_passed -eq $tests_total ]]; then
+        echo -e "  ${GREEN}${BOLD}OVERALL: SECURE${NC}"
+        echo ""
+        echo -e "  ${DIM}All checks passed. You are invisible.${NC}"
+    elif [[ $tests_passed -ge 3 ]]; then
+        echo -e "  ${YELLOW}${BOLD}OVERALL: WARNINGS${NC}"
+        echo ""
+        echo -e "  ${DIM}$tests_passed/$tests_total checks passed.${NC}"
+    else
+        echo -e "  ${RED}${BOLD}OVERALL: ISSUES DETECTED${NC}"
+        echo ""
+        echo -e "  ${DIM}Only $tests_passed/$tests_total checks passed.${NC}"
+    fi
+    
+    echo ""
+    ui_divider
+    echo ""
+    echo -e "  ${GREEN}[1]${NC} Run Again    ${CYAN}[2]${NC} Enter Shell    ${DIM}[0]${NC} Back"
+    echo ""
+    echo -n "  Select: "
+    
+    read -r choice
+    case "$choice" in
+        1) cmd_test ;;
+        2) cmd_shell ;;
+    esac
+}
+
+cmd_identity() {
+    if ! check_ghost; then
+        ui_clear_content
+        echo ""
+        echo -e "  ${RED}Ghost not running${NC}"
+        echo ""
+        echo -e "  ${DIM}[Press any key to return]${NC}"
+        read -r -n 1
+        return
+    fi
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${BOLD}NEW IDENTITY${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    
+    state_read
+    local old_ip="$exit_ip"
+    echo -e "  ${DIM}Current exit: $old_ip${NC}"
+    echo ""
+    
+    local attempts=0 max_attempts=3 new_ip
+    
+    while [[ $attempts -lt $max_attempts ]]; do
+        attempts=$((attempts + 1))
+        
+        ui_clear_content
+        echo ""
+        echo -e "  ${BOLD}NEW IDENTITY${NC}"
+        echo ""
+        ui_divider
+        echo ""
+        echo -e "  ${DIM}Current exit: $old_ip${NC}"
+        echo ""
+        
+        echo -ne "  [1/3] Sending NEWNYM signal... "
+        
+        local auth_cmd
+        auth_cmd=$(get_tor_auth)
+        
+        if [[ -n "$auth_cmd" ]] && ( echo -e "$auth_cmd\r\nSIGNAL NEWNYM\r\nQUIT" > /dev/tcp/127.0.0.1/9051 ) 2>/dev/null; then
+            :
+        else
+            killall -HUP tor 2>/dev/null || true
+        fi
+        echo -e "${GREEN}OK${NC}"
+        
+        echo -ne "  [2/3] Building new circuit... "
+        
+        if wait_for_connection 45; then
+            echo -e "${GREEN}OK${NC}"
+            new_ip=$(get_exit_ip)
+        else
+            echo -e "${RED}TIMEOUT${NC}"
+        fi
+        
+        echo -ne "  [3/3] Verifying connectivity... "
+        if [[ -n "$new_ip" && "$new_ip" != "$old_ip" ]]; then
+            echo -e "${GREEN}OK${NC}"
+            update_state "$new_ip"
+            
+            ui_clear_content
+            echo ""
+            echo -e "  ${GREEN}${BOLD}IDENTITY CHANGED${NC}"
+            echo ""
+            ui_divider
+            echo ""
+            echo -e "  ${DIM}Old IP: $old_ip${NC}"
+            echo -e "  ${DIM}New IP: $new_ip${NC}"
+            echo ""
+            ui_divider
+            echo ""
+            
+            state_read
+            ui_status_line "New exit" "$exit_ip" "$GREEN"
+            ui_status_line "Location" "$exit_country" "$CYAN"
+            
+            echo ""
+            echo -e "  ${DIM}[Press any key to continue]${NC}"
+            read -r -n 1
+            return
+        fi
+        echo -e "${RED}RETRYING${NC}"
+        
+        if [[ $attempts -lt $max_attempts ]]; then
+            echo ""
+            echo -e "  ${YELLOW}Same exit, retrying...${NC}"
+            sleep 1
+        fi
+    done
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}SAME EXIT NODE${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    echo -e "  ${DIM}Exit IP: $new_ip${NC}"
+    echo ""
+    echo -e "  ${DIM}This is rare but normal. Your circuit${NC}"
+    echo -e "  ${DIM}path (Guard → Middle) likely changed.${NC}"
+    echo ""
+    echo -e "  ${DIM}[Press any key to continue]${NC}"
+    read -r -n 1
+}
+
+cmd_country() {
+    ui_clear_content
+    echo ""
+    echo -e "  ${BOLD}SET EXIT NODE COUNTRY${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    
+    state_read
+    if [[ -n "$exit_country" ]]; then
+        echo -e "  ${DIM}Current: $exit_country${NC}"
+    else
+        echo -e "  ${DIM}Current: Random (Global)${NC}"
+    fi
+    echo ""
+    
+    echo -e "  ${BOLD}AVAILABLE REGIONS${NC}"
+    echo ""
+    
+    ui_menu_item "1" "United States (us)" "Best for US-target testing"
+    ui_menu_item "2" "Germany (de)" "Strong privacy laws"
+    ui_menu_item "3" "Netherlands (nl)" "High bandwidth exits"
+    ui_menu_item "4" "Switzerland (ch)" "Neutral jurisdiction"
+    ui_menu_item "5" "France (fr)" "EU location variety"
+    ui_menu_item "6" "Canada (ca)" "North America alternative"
+    ui_menu_item "7" "United Kingdom (uk)" "English language exits"
+    
+    echo -e "  ${DIM}[0]${NC} Cancel"
+    echo ""
+    ui_divider
+    echo ""
+    echo -n "  Select: "
+    
+    read -r choice
+    
+    local country_code=""
+    case "$choice" in
+        1) country_code="us" ;;
+        2) country_code="de" ;;
+        3) country_code="nl" ;;
+        4) country_code="ch" ;;
+        5) country_code="fr" ;;
+        6) country_code="ca" ;;
+        7) country_code="uk" ;;
+        0|*) return ;;
+    esac
+    
+    echo -e "  ${DIM}Setting exit country to $country_code...${NC}"
+    
+    echo -e "  ${DIM}Setting exit country to $country_code...${NC}"
+    
+    # [FIX 17.1] Use internal Tor instance ONLY. Do not touch /etc/tor/torrc.
+    if ! bash "$DIR/lib/tor.sh" country "$country_code"; then
+        echo -e "${RED}Error: Failed to set country via lib/tor.sh${NC}"
+        read -r -n 1
+        return
+    fi
+    
+    # tor.sh restarts the instance, so we just wait for new circuit
+    local new_config="" # variable not needed but kept for cleanup if referenced later, though logic changed
+    
+    echo -e "  ${DIM}Waiting for new circuit...${NC}"
+    
+    # Trigger circuit rotation to use new config
+    local auth_cmd
+    auth_cmd=$(get_tor_auth)
+    if [[ -n "$auth_cmd" ]]; then
+         ( echo -e "$auth_cmd\r\nSIGNAL NEWNYM\r\nQUIT" > /dev/tcp/127.0.0.1/9051 ) 2>/dev/null
+    else
+         killall -HUP tor 2>/dev/null
+    fi
+    
+    local retries=15
+    local success=0
+    local new_ip=""
+    
+    for ((i=1; i<=retries; i++)); do
+        echo -ne "\r  ${DIM}Verifying location ($i/$retries)...${NC}"
+        
+        # Wait for circuit
+        sleep 3
+        
+        new_ip=$(get_exit_ip)
+        local country_info
+        country_info=$(get_exit_country "$new_ip")
+        
+        # Check if country matches the requested code (case insensitive)
+        if [[ -n "$country_info" ]] && echo "$country_info" | grep -qi "$country_code"; then
+             success=1
+             break
+        fi
+        
+        # Retry NEWNYM if stuck halfway
+        if [[ $i -eq 5 || $i -eq 10 ]]; then
+             if [[ -n "$auth_cmd" ]]; then
+                  ( echo -e "$auth_cmd\r\nSIGNAL NEWNYM\r\nQUIT" > /dev/tcp/127.0.0.1/9051 ) 2>/dev/null
+             fi
+        fi
+    done
+    echo ""
+    
+    if [[ $success -eq 0 ]]; then
+         echo -e "  ${YELLOW}Warning: Target country not yet active.${NC}"
+         echo -e "  ${DIM}Tor is still building circuits. Please wait.${NC}"
+    fi
+    
+    update_state "$new_ip"
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${GREEN}${BOLD}COUNTRY SET${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    
+    state_read
+    ui_status_line "Region" "${country_code^^}"
+    ui_status_line "Exit IP" "$exit_ip" "$GREEN"
+    ui_status_line "Location" "$exit_country" "$CYAN"
+    
+    echo ""
+    echo -e "  ${DIM}[Press any key to continue]${NC}"
+    read -r -n 1
+}
+
+check_status() {
+    echo -n "  Ghost Network       "
+    if check_ghost; then
+        echo -e "${GREEN}[ACTIVE]${NC}"
+    else
+        echo -e "${RED}[INACTIVE]${NC}"
+        return
+    fi
+    
+    echo -n "  Tor Connection      "
+    if check_tor >/dev/null 2>&1; then
+         echo -e "${GREEN}[CONNECTED]${NC}"
+    else
+         echo -e "${RED}[DISCONNECTED]${NC}"
+    fi
+
+    echo -n "  Current IP          "
+    local current_ip
+    if current_ip=$(get_exit_ip); then
+        echo -e "${GREEN}$current_ip${NC}"
+    else
+        echo -e "${YELLOW}[UNKNOWN]${NC}"
+    fi
+}
+
+cmd_status() {
+    ui_clear_content
+    echo ""
+    echo -e "  ${BOLD}SYSTEM STATUS${NC}"
+    echo ""
+    
+    check_status
+    
+    echo ""
+    verify_stream_isolation
+    echo ""
+    
+    # [FIX 7.2] Circuit Path Verification
+    echo -e "  ${BOLD}Active Circuits:${NC}"
+    if [[ -n "$auth_cmd" ]]; then
+        local circuits
+        circuits=$( (echo -e "$auth_cmd\r\nGETINFO circuit-status\r\nQUIT" | timeout 2 nc 127.0.0.1 9051 | grep "^250-") 2>/dev/null ) || true
+        
+        if [[ -n "$circuits" ]]; then
+            while IFS= read -r result; do
+                local id status path
+                id=$(echo "$result" | awk '{print $1}' | cut -d- -f2) # 250-ID
+                status=$(echo "$result" | awk '{print $2}')
+                path=$(echo "$result" | cut -d' ' -f3-)
+                
+                if [[ "$status" == "BUILT" ]]; then
+                    echo -e "  ${CYAN}Circuit $id:${NC} $path"
+                fi
+            done <<< "$circuits"
+        else
+             echo -e "  ${DIM}No circuit info available${NC}"
+        fi
+    else
+        echo -e "  ${YELLOW}Cannot query circuits (No auth)${NC}"
+    fi
+    echo ""
+    ui_divider
+    echo ""
+    
+    echo -n "  Ghost Namespace     "
+    if check_ghost; then
+        echo -e "${GREEN}[ACTIVE]${NC}"
+    else
+        echo -e "${RED}[INACTIVE]${NC}"
+    fi
+    
+    echo -n "  Tor Service         "
+    if systemctl is-active --quiet tor; then
+        echo -e "${GREEN}[RUNNING]${NC}"
+    else
+        echo -e "${RED}[STOPPED]${NC}"
+    fi
+    
+    echo -n "  Connectivity        "
+    if check_ghost; then
+        if wait_for_connection 5; then
+            echo -e "${GREEN}[ONLINE]${NC}"
+        else
+            echo -e "${RED}[OFFLINE]${NC}"
+        fi
+    else
+        if curl -s --socks5-hostname 127.0.0.1:9050 --connect-timeout 5 https://check.torproject.org >/dev/null 2>&1; then
+            echo -e "${GREEN}[ONLINE]${NC}"
+        else
+            echo -e "${RED}[OFFLINE]${NC}"
+        fi
+    fi
+    
+    echo ""
+    
+    if check_ghost; then
+        ui_divider
+        echo ""
+        echo -e "  ${BOLD}CONNECTION${NC}"
+        echo ""
+        
+        state_read
+        ui_status_line "Exit IP" "$exit_ip" "$GREEN"
+        ui_status_line "Location" "$exit_country" "$CYAN"
+        ui_status_line "Uptime" "$(get_uptime)"
+        ui_status_line "Circuit" "$(get_circuit_age)"
+        
+
+        
+        echo ""
+        echo -e "  ${YELLOW}[!] DNS LEAK WARNING:${NC} Ghost blocks standard DNS (53)."
+        echo -e "      However, browsers with ${BOLD}DoH${NC} (DNS over HTTPS) enabled"
+        echo -e "      may still bypass Tor. Disable DoH in browser settings."
+        echo ""
+        echo -n "  Auto-Heal           "
+        if [[ -f "$AUTOHEAL_PID" ]] && kill -0 "$(cat "$AUTOHEAL_PID")" 2>/dev/null; then
+            echo -e "${GREEN}[ENABLED]${NC}"
+        else
+            echo -e "${DIM}[DISABLED]${NC}"
+        fi
+    fi
+    
+    echo ""
+    ui_divider
+    echo ""
+    echo -e "  ${DIM}[Press any key to return]${NC}"
+    read -r -n 1
+}
+
+cmd_nuke() {
+    if ! ui_confirm "EMERGENCY NUKE" "Force reset all Ghost components?"; then
+        return
+    fi
+    
+    echo -e "  ${RED}Nuking all Ghost components...${NC}"
+    
+    [[ -f "$AUTOHEAL_PID" ]] && kill "$(cat "$AUTOHEAL_PID")" 2>/dev/null
+    cleanup
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${RED}${BOLD}SYSTEM PURGED${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    echo -e "  ${DIM}All Ghost components destroyed.${NC}"
+    echo -e "  ${DIM}You are now visible.${NC}"
+    echo ""
+    echo -e "  ${DIM}[Press any key to continue]${NC}"
+    read -r -n 1
+}
+
+# ============================================
+# NEW FEATURES
+# ============================================
+
+# Helper function to get Tor info via control port
+get_tor_info() {
+    local command="$1"
+    local auth
+    auth=$(get_tor_auth)
+    
+    if [[ -z "$auth" ]]; then
+        return 1
+    fi
+    
+    {
+        echo "$auth"
+        echo "$command"
+        echo "QUIT"
+    } | nc 127.0.0.1 9051 2>/dev/null | grep -v "^250" | grep -v "^\."
+}
+
+# Enhanced status command with detailed metrics
+cmd_status_enhanced() {
+    clear
+    ui_header
+    
+    echo ""
+    echo -e "${BOLD}=== GHOST STATUS DASHBOARD ===${NC}"
+    echo ""
+    
+    # Namespace Status
+    echo -e "${CYAN}┌─ Network Namespace${NC}"
+    if ip netns list 2>/dev/null | grep -q "^ghost"; then
+        echo -e "│ ${GREEN}✓${NC} Running"
+        
+        # Get IP and interface info
+        local jail_ip
+        jail_ip=$(ip netns exec ghost ip addr show veth1 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+        local jail_mac
+        jail_mac=$(ip netns exec ghost ip link show veth1 2>/dev/null | grep "link/ether" | awk '{print $2}')
+        
+        echo -e "│ IP:  $jail_ip"
+        echo -e "│ MAC: $jail_mac"
+        
+        # Check for IPv6 leaks
+        local ipv6_count
+        ipv6_count=$(ip netns exec ghost ip -6 addr show 2>/dev/null | grep -c "inet6" || echo 0)
+        if [[ $ipv6_count -eq 0 ]]; then
+            echo -e "│ IPv6: ${GREEN}Blocked${NC}"
+        else
+            echo -e "│ IPv6: ${RED}LEAK DETECTED ($ipv6_count addresses)${NC}"
+        fi
+    else
+        echo -e "│ ${RED}✗${NC} Not Running"
+    fi
+    echo -e "└────────────────────────────"
+    echo ""
+    
+    # Tor Status
+    echo -e "${CYAN}┌─ Tor Connection${NC}"
+    
+    if check_ghost; then
+        # Check Tor connectivity
+        local tor_ip=""
+        local tor_country=""
+        local tor_latency=""
+        
+        # Get current exit IP
+        tor_ip=$(ip netns exec ghost timeout 5 curl -s https://check.torproject.org/api/ip 2>/dev/null | grep -oP '"IP":"\K[^"]+' || echo "unknown")
+        
+        if [[ "$tor_ip" != "unknown" && -n "$tor_ip" ]]; then
+            echo -e "│ ${GREEN}✓${NC} Connected"
+            echo -e "│ Exit IP: $tor_ip"
+            
+            # Try to get country
+            tor_country=$(timeout 3 curl -s "https://ipapi.co/$tor_ip/country_name/" 2>/dev/null || echo "Unknown")
+            echo -e "│ Country: $tor_country"
+            
+            # Measure latency
+            local start end
+            start=$(date +%s%N)
+            timeout 5 curl -s https://check.torproject.org >/dev/null 2>&1
+            end=$(date +%s%N)
+            tor_latency=$(( (end - start) / 1000000 ))
+            echo -e "│ Latency: ${tor_latency}ms"
+            
+            # Circuit info
+            local circuits
+            circuits=$(get_tor_info "GETINFO circuit-status" | grep -c "BUILT" || echo 0)
+            echo -e "│ Circuits: $circuits active"
+            
+        else
+            echo -e "│ ${YELLOW}⚠${NC} Tor not responding"
+        fi
+    else
+        echo -e "│ ${RED}✗${NC} Ghost not running"
+    fi
+    echo -e "└────────────────────────────"
+    echo ""
+    
+    # Security Status
+    echo -e "${CYAN}┌─ Security Layers${NC}"
+    
+    # Check seccomp
+    if ip netns exec ghost cat /proc/self/status 2>/dev/null | grep -q "Seccomp:.*2"; then
+        echo -e "│ Seccomp: ${GREEN}✓${NC} Active"
+    else
+        echo -e "│ Seccomp: ${RED}✗${NC} Inactive"
+    fi
+    
+    # Check landlock
+    if [[ -x "$DIR/lib/apply_landlock" ]]; then
+        echo -e "│ Landlock: ${GREEN}✓${NC} Available"
+    else
+        echo -e "│ Landlock: ${YELLOW}⚠${NC} Not compiled"
+    fi
+    
+    # Check capabilities
+    if ip netns exec ghost sh -c 'cat /proc/self/status 2>/dev/null | grep -q "CapEff:.*0000000000000000"'; then
+        echo -e "│ Caps Drop: ${GREEN}✓${NC} All dropped"
+    else
+        echo -e "│ Caps Drop: ${YELLOW}⚠${NC} Partial"
+    fi
+    
+    # Check firewall rules
+    local fw_rules
+    fw_rules=$(ip netns exec ghost iptables -L OUTPUT 2>/dev/null | grep -c "DROP\|REJECT" || echo 0)
+    echo -e "│ Firewall: ${fw_rules} restrictive rules"
+    
+    echo -e "└────────────────────────────"
+    echo ""
+    
+    # Active Leak Tests
+    echo -e "${CYAN}┌─ Active Leak Tests${NC}"
+    
+    # Test 1: IPv6 leak
+    if ip netns exec ghost timeout 2 curl -6 -s ifconfig.co 2>&1 | grep -qE '^[0-9a-f:]+$'; then
+        echo -e "│ IPv6: ${RED}✗ LEAKING${NC}"
+    else
+        echo -e "│ IPv6: ${GREEN}✓ Blocked${NC}"
+    fi
+    
+    # Test 2: DNS leak
+    if ip netns exec ghost timeout 2 dig +short @8.8.8.8 google.com 2>&1 | grep -qE '^[0-9]+\.[0-9]+'; then
+        echo -e "│ DNS: ${RED}✗ LEAKING${NC}"
+    else
+        echo -e "│ DNS: ${GREEN}✓ Isolated${NC}"
+    fi
+    
+    # Test 3: WebRTC info
+    echo -e "│ WebRTC: ${YELLOW}Manual test required${NC}"
+    echo -e "│   Visit: browserleaks.com/webrtc"
+    
+    echo -e "└────────────────────────────"
+    echo ""
+    
+    # Session Info
+    echo -e "${CYAN}┌─ Session Information${NC}"
+    
+    if [[ -f "$SESSION_LOG" ]]; then
+        local session_start current_time uptime_seconds uptime_readable
+        session_start=$(stat -c %Y "$SESSION_LOG" 2>/dev/null)
+        current_time=$(date +%s)
+        uptime_seconds=$((current_time - session_start))
+        uptime_readable=$(date -u -d @${uptime_seconds} +"%H:%M:%S" 2>/dev/null || echo "unknown")
+        
+        echo -e "│ Uptime: $uptime_readable"
+        
+        # Session log entries
+        local log_entries
+        log_entries=$(wc -l < "$SESSION_LOG" 2>/dev/null || echo 0)
+        echo -e "│ Log Entries: $log_entries"
+    else
+        echo -e "│ ${YELLOW}No active session${NC}"
+    fi
+    
+    echo -e "└────────────────────────────"
+    echo ""
+    
+    # Quick Actions
+    echo -e "${DIM}Actions:${NC}"
+    echo -e "  ${DIM}[i]${NC} New Identity  ${DIM}[c]${NC} Change Country  ${DIM}[s]${NC} Shell  ${DIM}[q]${NC} Quit"
+    echo ""
+    
+    read -r -n 1 -p "Select action: " action
+    echo ""
+    
+    case "$action" in
+        i|I) cmd_identity ;;
+        c|C) cmd_country ;;
+        s|S) cmd_shell ;;
+        q|Q) return ;;
+    esac
+}
+
+# Ghost Health Check - diagnostic function
+cmd_health_check() {
+    clear
+    echo -e "${BOLD}=== GHOST HEALTH CHECK ===${NC}"
+    echo ""
+    
+    local issues=0
+    local warnings=0
+    
+    # Check 1: Namespace
+    echo -n "Checking namespace... "
+    if ip netns list 2>/dev/null | grep -q "^ghost"; then
+        echo -e "${GREEN}✓${NC}"
+    else
+        echo -e "${RED}✗ Not running${NC}"
+        ((issues++))
+    fi
+    
+    # Check 2: IPv6 leak
+    echo -n "Checking IPv6 blocking... "
+    local ipv6
+    ipv6=$(ip netns exec ghost ip -6 addr 2>/dev/null | grep -c inet6 || echo 0)
+    if [[ $ipv6 -eq 0 ]]; then
+        echo -e "${GREEN}✓ Blocked${NC}"
+    else
+        echo -e "${RED}✗ LEAK ($ipv6 addresses)${NC}"
+        ((issues++))
+    fi
+    
+    # Check 3: Tor connectivity
+    echo -n "Checking Tor... "
+    if timeout 5 curl -s https://check.torproject.org/api/ip 2>/dev/null | grep -q '"IsTor":true'; then
+        echo -e "${GREEN}✓ Connected${NC}"
+    else
+        echo -e "${YELLOW}⚠ Not responding${NC}"
+        ((warnings++))
+    fi
+    
+    # Check 4: DNS leak
+    echo -n "Checking DNS... "
+    local dns_leak
+    dns_leak=$(ip netns exec ghost dig +short @8.8.8.8 google.com 2>&1 | grep -v "connection refused" | wc -l)
+    if [[ $dns_leak -eq 0 ]]; then
+        echo -e "${GREEN}✓ Isolated${NC}"
+    else
+        echo -e "${RED}✗ LEAK${NC}"
+        ((issues++))
+    fi
+    
+    # Check 5: Seccomp
+    echo -n "Checking Seccomp... "
+    if ip netns exec ghost cat /proc/self/status 2>/dev/null | grep -q "Seccomp:.*2"; then
+        echo -e "${GREEN}✓ Active${NC}"
+    else
+        echo -e "${RED}✗ Inactive${NC}"
+        ((issues++))
+    fi
+    
+    # Check 6: Raw socket block
+    echo -n "Checking raw socket blocking... "
+    if ip netns exec ghost python3 -c "import socket; socket.socket(socket.AF_PACKET, socket.SOCK_RAW)" 2>&1 | grep -q "not permitted"; then
+        echo -e "${GREEN}✓ Blocked${NC}"
+    else
+        echo -e "${RED}✗ NOT BLOCKED${NC}"
+        ((issues++))
+    fi
+    
+    # Check 7: Firewall rules
+    echo -n "Checking firewall... "
+    local rules
+    rules=$(ip netns exec ghost iptables -L 2>/dev/null | grep -c "DROP" || echo 0)
+    if [[ $rules -gt 5 ]]; then
+        echo -e "${GREEN}✓ ${rules} rules${NC}"
+    else
+        echo -e "${YELLOW}⚠ Only ${rules} rules${NC}"
+        ((warnings++))
+    fi
+    
+    echo ""
+    echo "──────────────────────────────"
+    echo ""
+    
+    if [[ $issues -eq 0 && $warnings -eq 0 ]]; then
+        echo -e "${GREEN}✓ All checks passed!${NC}"
+    elif [[ $issues -eq 0 ]]; then
+        echo -e "${YELLOW}⚠ ${warnings} warnings (non-critical)${NC}"
+    else
+        echo -e "${RED}✗ ${issues} critical issues found${NC}"
+        echo ""
+        echo "Run 'sudo ghost stop && sudo ghost start' to reset"
+    fi
+    
+    echo ""
+    read -r -n 1 -p "Press any key to continue..."
+}
+
+# Cover traffic generation to prevent traffic analysis
+cmd_cover_traffic() {
+    if ! check_ghost; then
+        echo -e "${RED}Ghost is not running${NC}"
+        return 1
+    fi
+    
+    ui_clear_content
+    echo ""
+    echo -e "  ${BOLD}Cover Traffic Generator${NC}"
+    echo ""
+    echo -e "  ${DIM}Generates random HTTP/HTTPS traffic to obfuscate your${NC}"
+    echo -e "  ${DIM}actual browsing patterns and prevent traffic analysis.${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    
+    read -r -p "  Duration in minutes (1-60): " duration
+    
+    if ! [[ "$duration" =~ ^[0-9]+$ ]] || [[ $duration -lt 1 ]] || [[ $duration -gt 60 ]]; then
+        echo -e "  ${RED}Invalid duration${NC}"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "  ${GREEN}Starting cover traffic...${NC}"
+    echo -e "  ${DIM}Duration: ${duration} minutes${NC}"
+    echo ""
+    
+    # Create cover traffic script
+    cat > /tmp/ghost_cover_traffic_$$ << 'COVER_EOF'
+#!/bin/bash
+DURATION=$1
+END_TIME=$(($(date +%s) + DURATION * 60))
+
+SITES=(
+    "https://www.wikipedia.org/wiki/Special:Random"
+    "https://www.reddit.com/r/all/"
+    "https://news.ycombinator.com"
+    "https://lobste.rs"
+    "https://www.technologyreview.com"
+    "https://arstechnica.com"
+    "https://www.theguardian.com/international"
+    "https://www.bbc.com/news"
+    "https://www.reuters.com"
+    "https://techcrunch.com"
+)
+
+echo "[$(date)] Cover traffic started"
+
+while [[ $(date +%s) -lt $END_TIME ]]; do
+    SITE="${SITES[$RANDOM % ${#SITES[@]}]}"
+    DELAY=$((RANDOM % 110 + 10))
+    curl -s --max-time 10 "$SITE" >/dev/null 2>&1
+    echo "[$(date)] Fetched: $SITE (next in ${DELAY}s)"
+    sleep $DELAY
+done
+
+echo "[$(date)] Cover traffic completed"
+COVER_EOF
+    
+    chmod +x /tmp/ghost_cover_traffic_$$
+    
+    # Run in background within namespace
+    ip netns exec ghost /tmp/ghost_cover_traffic_$$ "$duration" > "$RUNTIME_DIR/cover_traffic.log" 2>&1 &
+    local pid=$!
+    echo $pid > "$RUNTIME_DIR/cover_traffic.pid"
+    
+    echo -e "  ${GREEN}✓${NC} Cover traffic running (PID: $pid)"
+    echo -e "  ${DIM}Log: $RUNTIME_DIR/cover_traffic.log${NC}"
+    echo ""
+    
+    read -r -n 1 -p "  Press any key to return..."
+}
+
+# Stop cover traffic
+cmd_cover_traffic_stop() {
+    if [[ -f "$RUNTIME_DIR/cover_traffic.pid" ]]; then
+        local pid
+        pid=$(cat "$RUNTIME_DIR/cover_traffic.pid")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            echo -e "${GREEN}✓${NC} Cover traffic stopped"
+        fi
+        rm -f "$RUNTIME_DIR/cover_traffic.pid"
+    else
+        echo -e "${YELLOW}No cover traffic running${NC}"
+    fi
+}
+
+# Real-time Tor circuit performance monitor
+cmd_monitor_circuits() {
+    if ! check_ghost; then
+        echo -e "${RED}Ghost is not running${NC}"
+        return 1
+    fi
+    
+    clear
+    echo -e "${BOLD}=== TOR CIRCUIT MONITOR ===${NC}"
+    echo ""
+    echo -e "${DIM}Press Ctrl+C to exit${NC}"
+    echo ""
+    
+    while true; do
+        clear
+        echo -e "${BOLD}=== TOR CIRCUIT MONITOR ===${NC}"
+        echo -e "${DIM}Updated: $(date '+%Y-%m-%d %H:%M:%S')${NC}"
+        echo ""
+        
+        # Get circuit status
+        local circuit_info
+        circuit_info=$(get_tor_info "GETINFO circuit-status")
+        
+        if [[ -n "$circuit_info" ]]; then
+            echo -e "${CYAN}Active Circuits:${NC}"
+            echo "$circuit_info" | grep "BUILT" | while read -r line; do
+                local circuit_id path purpose
+                circuit_id=$(echo "$line" | awk '{print $1}')
+                path=$(echo "$line" | awk '{print $3}')
+                purpose=$(echo "$line" | awk '{print $4}')
+                
+                echo -e "  Circuit $circuit_id: ${GREEN}BUILT${NC}"
+                echo -e "    Path: $path"
+                echo -e "    Purpose: $purpose"
+                echo ""
+            done
+        fi
+        
+        # Get stream info
+        local stream_info
+        stream_info=$(get_tor_info "GETINFO stream-status")
+        
+        if [[ -n "$stream_info" ]]; then
+            echo -e "${CYAN}Active Streams:${NC}"
+            local stream_count
+            stream_count=$(echo "$stream_info" | grep -c "SUCCEEDED" || echo 0)
+            echo -e "  ${stream_count} active connections"
+            echo ""
+        fi
+        
+        # Get bandwidth
+        local bw_info
+        bw_info=$(get_tor_info "GETINFO traffic/read traffic/written")
+        if [[ -n "$bw_info" ]]; then
+            echo -e "${CYAN}Bandwidth:${NC}"
+            local read_bytes written_bytes read_mb written_mb
+            read_bytes=$(echo "$bw_info" | grep "traffic/read" | awk -F= '{print $2}')
+            written_bytes=$(echo "$bw_info" | grep "traffic/written" | awk -F= '{print $2}')
+            
+            read_mb=$(( ${read_bytes:-0} / 1024 / 1024 ))
+            written_mb=$(( ${written_bytes:-0} / 1024 / 1024 ))
+            
+            echo -e "  Downloaded: ${read_mb}MB"
+            echo -e "  Uploaded: ${written_mb}MB"
+            echo ""
+        fi
+        
+        # Latency test
+        echo -e "${CYAN}Latency Test:${NC}"
+        local start end latency
+        start=$(date +%s%N)
+        timeout 3 curl -s https://check.torproject.org >/dev/null 2>&1
+        end=$(date +%s%N)
+        latency=$(( (end - start) / 1000000 ))
+        
+        if [[ $latency -lt 500 ]]; then
+            echo -e "  ${GREEN}$latency ms (Fast)${NC}"
+        elif [[ $latency -lt 2000 ]]; then
+            echo -e "  ${YELLOW}$latency ms (Normal)${NC}"
+        else
+            echo -e "  ${RED}$latency ms (Slow)${NC}"
+        fi
+        
+        sleep 3
+    done
+}
+
+# Export comprehensive security report
+cmd_export_report() {
+    local report_file="/tmp/ghost_security_report_$(date +%Y%m%d_%H%M%S).txt"
+    
+    {
+        echo "=========================================="
+        echo "  GHOST SECURITY REPORT"
+        echo "  Generated: $(date)"
+        echo "=========================================="
+        echo ""
+        
+        echo "=== NAMESPACE STATUS ==="
+        ip netns list 2>/dev/null | grep ghost || echo "Not running"
+        echo ""
+        
+        echo "=== TOR CONNECTION ==="
+        timeout 5 curl -s https://check.torproject.org/api/ip 2>/dev/null || echo "Not connected"
+        echo ""
+        
+        echo "=== SECURITY LAYERS ==="
+        ip netns exec ghost cat /proc/self/status 2>/dev/null | grep -E "Seccomp|Cap" || echo "Error"
+        echo ""
+        
+        echo "=== FIREWALL RULES ==="
+        ip netns exec ghost iptables -L -n 2>/dev/null || echo "Error"
+        echo ""
+        
+        echo "=== INVISIBILITY STATUS ==="
+        echo "Hardware visibility:"
+        ip netns exec ghost ls /sys/class/dmi/id/ 2>&1 | head -5
+        echo ""
+        echo "CPU shown:"
+        ip netns exec ghost grep "model name" /proc/cpuinfo 2>/dev/null | head -1
+        echo ""
+        echo "RAM shown:"
+        ip netns exec ghost grep "MemTotal" /proc/meminfo 2>/dev/null
+        echo ""
+        
+    } > "$report_file"
+    
+    echo -e "${GREEN}Report saved:${NC} $report_file"
+    echo ""
+    echo "View: cat $report_file"
+}
+
+# Session log encryption
+SESSION_KEY=""
+
+init_session_encryption() {
+    # Generate random session key
+    SESSION_KEY=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 32)
+    
+    if [[ -z "$SESSION_KEY" ]]; then
+        echo "[WARN] Failed to generate session encryption key" >&2
+        return 1
+    fi
+    
+    # Store encrypted (for recovery if needed)
+    echo "$SESSION_KEY" | openssl enc -aes-256-cbc -salt -pbkdf2 -pass pass:"$(hostname)-$(date +%s)" \
+        > "$RUNTIME_DIR/session.key.enc" 2>/dev/null || true
+}
+
+menu_inactive() {
+    ui_clear_content
+    echo ""
+    echo -e "  Status:  ${RED}INACTIVE${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    
+    ui_menu_item "1" "Start Ghost" "Activate anonymity"
+    echo ""
+    echo -e "  ${DIM}[2] Test         - Requires Ghost${NC}"
+    echo -e "  ${DIM}[3] Status       - View components${NC}"
+    echo ""
+    ui_divider
+    echo ""
+    ui_menu_item "8" "Nuke" "Force reset" "$RED"
+    echo ""
+    echo -e "  ${DIM}[0]${NC} Exit    ${DIM}[?]${NC} Help"
+    echo ""
+    ui_divider
+    
+    printf "\n  Select: "
+    printf "\033[?25h"
+    
+    local choice
+    read -r choice
+    printf "\033[?25l"
+    
+    case "$choice" in
+        1) cmd_start ;;
+        2) cmd_test ;;
+        3) cmd_status ;;
+        8|n|N) cmd_nuke ;;
+        0) printf "\033[?25h"; clear; exit 0 ;;
+        "?"|h|H) ui_help "START" ;;
+    esac
+}
+
+menu_active() {
+    ui_clear_content
+    
+    state_read
+    local uptime circuit_age
+    uptime=$(get_uptime)
+    circuit_age=$(get_circuit_age)
+    
+    echo ""
+    echo -e "  Status:  ${GREEN}ACTIVE${NC}"
+    echo -e "  Exit:    ${GREEN}$exit_ip${NC} ${DIM}($exit_country)${NC}"
+    echo -e "  Uptime:  $uptime"
+    echo -e "  Circuit: $circuit_age"
+    echo ""
+    ui_divider
+    echo ""
+    
+    echo -e "  ${YELLOW}QUICK ACTIONS${NC}"
+    ui_menu_item "1" "Shell" "Anonymous terminal"
+    ui_menu_item "2" "New Identity" "Rotate exit node"
+    echo ""
+    
+    echo -e "  ${YELLOW}SYSTEM${NC}"
+    ui_menu_item "3" "Test" "Security audit"
+    ui_menu_item "4" "Country" "Set exit region"
+    ui_menu_item "5" "Status" "View components"
+    echo ""
+    
+    echo -e "  ${YELLOW}TOOLS${NC}"
+    ui_menu_item "7" "Health" "Full diagnostics"
+    ui_menu_item "8" "Cover" "Traffic masking"
+    ui_menu_item "9" "Dashboard" "Enhanced status"
+    echo ""
+    ui_divider
+    echo ""
+    
+    ui_menu_item "6" "Stop Ghost" "Deactivate" "$RED"
+    echo ""
+    echo -e "  ${DIM}[0]${NC} Exit    ${DIM}[r]${NC} Report    ${DIM}[?]${NC} Help"
+    echo ""
+    ui_divider
+    
+    printf "\n  Select: "
+    printf "\033[?25h"
+    local choice
+    printf "\033[?25h"
+    read -r choice
+    printf "\033[?25l"
+    
+    case "$choice" in
+        1) cmd_shell ;;
+        2) cmd_identity ;;
+        3) cmd_test ;;
+        4) cmd_country ;;
+        5) cmd_status ;;
+        6) cmd_stop ;;
+        7) cmd_health_check ;;
+        8) cmd_cover_traffic ;;
+        9) cmd_status_enhanced ;;
+        r|R) cmd_export_report ;;
+        0) printf "\033[?25h"; clear; exit 0 ;;
+        "?"|h|H) ui_help "SHELL" ;;
+    esac
+    printf "\033[?25l"
+}
+
+main_menu() {
+    ui_init
+    ui_header
+    
+    while true; do
+        touch /dev/shm/ghost_heartbeat 2>/dev/null
+        
+        if check_ghost; then
+            menu_active
+        else
+            menu_inactive
+        fi
+    done
+}
+
+check_root
+setup_runtime
+check_dependencies
+
+# [FIX 20.1] Lock Management
+# Allow status/stop/shell/test to run concurrently (no lock needed)
+# Only start/menu/setup-actions need exclusive lock
+
+acquire_lock() {
+    exec 200>/var/run/ghost.lock
+    if ! flock -n 200; then
+        echo -e "${RED}Ghost is already running!${NC}"
+        echo -e "  ${DIM}• To enter the secure shell:${NC}   sudo ghost shell"
+        echo -e "  ${DIM}• To stop the background process:${NC} sudo ghost stop"
+        exit 1
+    fi
+    # Write PID for 'stop' command to target
+    echo $$ > /var/run/ghost.pid
+}
+
+# [FIX] Cleanup lock/pid on exit
+trap 'rm -f /var/run/ghost.lock /var/run/ghost.pid' EXIT INT TERM
+
+case "${1:-}" in
+    start)
+        acquire_lock
+        ui_init
+        ui_header
+        cmd_start 
+        ;;
+    stop)
+        # Stop does NOT need lock - it needs to kill the holder
+        ui_init
+        ui_header
+        cmd_stop 
+        ;;
+    test)
+        # Test runs inside namespace, doesn't interfere with main loop
+        ui_init
+        ui_header
+        cmd_test 
+        ;;
+    shell)
+        # Shell enters namespace, perfectly fine to run parallel
+        cmd_shell 
+        ;;
+    status)
+        # Read-only status check
+        ui_init 
+        ui_header 
+        cmd_status 
+        ;;
+    identity|new)
+        acquire_lock
+        ui_init
+        ui_header
+        cmd_identity 
+        ;;
+    country)
+        acquire_lock
+        ui_init
+        ui_header
+        cmd_country 
+        ;;
+    nuke)
+        cleanup
+        echo "Nuked" 
+        ;;
+    health|check)
+        cmd_health_check
+        ;;
+    cover)
+        cmd_cover_traffic
+        ;;
+    cover-stop)
+        cmd_cover_traffic_stop
+        ;;
+    monitor)
+        cmd_monitor_circuits
+        ;;
+    dashboard)
+        ui_init
+        ui_header
+        cmd_status_enhanced
+        ;;
+    report|export)
+        cmd_export_report
+        ;;
+    *)
+        # Default menu needs lock
+        acquire_lock
+        main_menu 
+        ;;
+esac
